@@ -209,7 +209,16 @@ struct dev_context {
 	struct libusb_transfer **transfers;
 	struct sr_context *ctx;
 
-	uint16_t *deinterleave_buffer;
+	/*
+	 * Deinterleaved sample buffer. Element width is sample_unitsize
+	 * bytes (2 for <=16 enabled channels, matching every existing V1/V2
+	 * device; 4 for >16, needed only by DSLOGIC_CAPS_CH32 profiles).
+	 * void* rather than uint16_t* because of that variable width -
+	 * callers must scale pointer arithmetic by sample_unitsize, not
+	 * sizeof(uint16_t).
+	 */
+	void *deinterleave_buffer;
+	unsigned int sample_unitsize;
 
 	uint16_t mode;
 	uint32_t trigger_pos;
