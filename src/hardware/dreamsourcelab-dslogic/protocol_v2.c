@@ -280,6 +280,8 @@ static int v2_fpga_firmware_upload(const struct sr_dev_inst *sdi)
 
 	if (!strcmp(devc->profile->model, "DSLogic Plus")) {
 		name = "dreamsourcelab-dslogic-plus-fpga.fw";
+	} else if (!strcmp(devc->profile->model, "DSLogic U3Pro32")) {
+		name = "dreamsourcelab-dslogic-u3pro32-fpga.fw";
 	} else {
 		sr_err("v2: no FPGA firmware for model '%s'.", devc->profile->model);
 		return SR_ERR;
@@ -406,11 +408,22 @@ static int v2_fpga_firmware_upload(const struct sr_dev_inst *sdi)
 	wr.data[0] = bmLED_GREEN;
 	if ((ret = command_ctl_wr_v2(hdl, wr)) != SR_OK) goto fail;
 
-	/* 13) Re-assert WORDWIDE high (dsl.c) */
-	wr.header.dest = DSL_CTL_WORDWIDE;
-	wr.header.size = 1;
-	wr.data[0] = bmWR_WORDWIDE;
-	if ((ret = command_ctl_wr_v2(hdl, wr)) != SR_OK) goto fail;
+	/*
+	 * 13) Re-assert WORDWIDE high (dsl.c) - FX2/HighSpeed-only GPIF
+	 * 16-bit-wide mode setting. Skipped when actually running at USB3
+	 * SuperSpeed: DSL fork's dsl_fpga_arm() never issues this control
+	 * write when usb_speed == LIBUSB_SPEED_SUPER (dsl.c:1211-1219) - the
+	 * GPIF word-width concept doesn't apply to the FX3 SuperSpeed
+	 * datapath. Gate on the actually-negotiated link speed, not just
+	 * DSLOGIC_CAPS_USB30: a USB3-capable device plugged into a USB2
+	 * port falls back to HighSpeed and still needs this write.
+	 */
+	if (devc->usb_speed != LIBUSB_SPEED_SUPER) {
+		wr.header.dest = DSL_CTL_WORDWIDE;
+		wr.header.size = 1;
+		wr.data[0] = bmWR_WORDWIDE;
+		if ((ret = command_ctl_wr_v2(hdl, wr)) != SR_OK) goto fail;
+	}
 
 	sr_info("FPGA configure done: %" PRIu64 " bytes.", bitstream.size);
 	sr_resource_close(drvc->sr_ctx, &bitstream);
@@ -456,24 +469,119 @@ static const struct dslogic_channel_mode dslogic_plus_modes[] = {
 
 #define DSLOGIC_PLUS_DEFAULT_CH_MODE_ID 0   /* matches DSView's DSL_BUFFER100x16 */
 
-SR_PRIV const struct dslogic_channel_mode *dslogic_plus_channel_modes(size_t *count)
+/*
+ * Channel-mode tables for DSLogic U3Pro32 (PID 0x002c). Buffered-mode
+ * entries (readout happens after capture completes, from onboard RAM)
+ * are link-speed independent and identical in both tables. Streaming
+ * entries (readout happens live, bounded by USB throughput) differ
+ * sharply: the USB2 HighSpeed fallback link only sustains the slow
+ * "_3DN2" family, while the USB3 SuperSpeed link reaches far higher
+ * rates. Values and hw_max_samplerate/pre_div mirror DSView's
+ * channel_modes[] rows DSL_STREAM*_32_3DN2 / DSL_STREAM50x32 /
+ * DSL_STREAM100x30 / DSL_STREAM250x12 / DSL_STREAM500x6 /
+ * DSL_STREAM1000x3 / DSL_BUFFER250x32 / DSL_BUFFER500x16 /
+ * DSL_BUFFER1000x8 (dsl.h).
+ */
+static const struct dslogic_channel_mode dslogic_u3pro32_hs_modes[] = {
+	/* id  stream  ch  min_sr       max_sr       hw_max      pre  descr */
+	{   0, FALSE,  32, SR_MHZ(1),   SR_MHZ(250), SR_MHZ(250), 1,
+		"32 channels, buffered (max 250 MHz)" },
+	{   1, FALSE,  16, SR_MHZ(1),   SR_MHZ(500), SR_MHZ(500), 1,
+		"16 channels, buffered (max 500 MHz)" },
+	{   2, FALSE,   8, SR_MHZ(1),   SR_GHZ(1),   SR_GHZ(1),   1,
+		"8 channels, buffered (max 1 GHz)" },
+	{   3, TRUE,   32, SR_KHZ(100), SR_MHZ(10),  SR_MHZ(500), 5,
+		"32 channels, streaming (max 10 MHz)" },
+	{   4, TRUE,   16, SR_KHZ(100), SR_MHZ(20),  SR_MHZ(500), 5,
+		"16 channels, streaming (max 20 MHz)" },
+	{   5, TRUE,   12, SR_KHZ(100), SR_MHZ(25),  SR_MHZ(500), 5,
+		"12 channels, streaming (max 25 MHz)" },
+	{   6, TRUE,    6, SR_KHZ(100), SR_MHZ(50),  SR_MHZ(500), 5,
+		"6 channels, streaming (max 50 MHz)" },
+	{   7, TRUE,    3, SR_KHZ(100), SR_MHZ(100), SR_MHZ(500), 5,
+		"3 channels, streaming (max 100 MHz)" },
+};
+
+static const struct dslogic_channel_mode dslogic_u3pro32_ss_modes[] = {
+	/* id  stream  ch  min_sr      max_sr       hw_max      pre  descr */
+	{   0, FALSE,  32, SR_MHZ(1),  SR_MHZ(250), SR_MHZ(250), 1,
+		"32 channels, buffered (max 250 MHz)" },
+	{   1, FALSE,  16, SR_MHZ(1),  SR_MHZ(500), SR_MHZ(500), 1,
+		"16 channels, buffered (max 500 MHz)" },
+	{   2, FALSE,   8, SR_MHZ(1),  SR_GHZ(1),   SR_GHZ(1),   1,
+		"8 channels, buffered (max 1 GHz)" },
+	{   3, TRUE,   32, SR_MHZ(1),  SR_MHZ(50),  SR_MHZ(500), 5,
+		"32 channels, streaming (max 50 MHz)" },
+	{   4, TRUE,   30, SR_MHZ(1),  SR_MHZ(100), SR_MHZ(500), 5,
+		"30 channels, streaming (max 100 MHz)" },
+	{   5, TRUE,   12, SR_MHZ(1),  SR_MHZ(250), SR_MHZ(500), 5,
+		"12 channels, streaming (max 250 MHz)" },
+	{   6, TRUE,    6, SR_MHZ(1),  SR_MHZ(500), SR_MHZ(500), 5,
+		"6 channels, streaming (max 500 MHz)" },
+	{   7, TRUE,    3, SR_MHZ(1),  SR_GHZ(1),   SR_MHZ(500), 5,
+		"3 channels, streaming (max 1 GHz)" },
+};
+
+#define DSLOGIC_U3PRO32_DEFAULT_CH_MODE_ID 0   /* matches DSView's DSL_BUFFER250x32 */
+
+static const struct dslogic_channel_mode *dslogic_plus_channel_modes(size_t *count)
 {
 	if (count)
 		*count = ARRAY_SIZE(dslogic_plus_modes);
 	return dslogic_plus_modes;
 }
 
-SR_PRIV const struct dslogic_channel_mode *dslogic_plus_channel_mode_default(void)
+/*
+ * U3Pro32's streaming table depends on the negotiated USB link speed
+ * (devc->usb_speed, queried once at dev_open). Falls back to the HS
+ * (slower) table if speed isn't known yet, so early callers (before
+ * dev_open has run) get a conservative answer rather than overclaiming.
+ */
+static const struct dslogic_channel_mode *dslogic_u3pro32_modes_table(
+		const struct dev_context *devc, size_t *count)
 {
-	return &dslogic_plus_modes[DSLOGIC_PLUS_DEFAULT_CH_MODE_ID];
+	if (devc->usb_speed == LIBUSB_SPEED_SUPER) {
+		if (count)
+			*count = ARRAY_SIZE(dslogic_u3pro32_ss_modes);
+		return dslogic_u3pro32_ss_modes;
+	}
+	if (count)
+		*count = ARRAY_SIZE(dslogic_u3pro32_hs_modes);
+	return dslogic_u3pro32_hs_modes;
 }
 
-SR_PRIV const struct dslogic_channel_mode *dslogic_plus_channel_mode_by_id(uint8_t id)
+SR_PRIV const struct dslogic_channel_mode *dslogic_channel_modes(
+		const struct dev_context *devc, size_t *count)
 {
+	if (devc->profile->dev_caps & DSLOGIC_CAPS_CH32)
+		return dslogic_u3pro32_modes_table(devc, count);
+	return dslogic_plus_channel_modes(count);
+}
+
+SR_PRIV const struct dslogic_channel_mode *dslogic_channel_mode_default(
+		const struct dev_context *devc)
+{
+	size_t count;
+	const struct dslogic_channel_mode *modes = dslogic_channel_modes(devc, &count);
+	uint8_t default_id = (devc->profile->dev_caps & DSLOGIC_CAPS_CH32) ?
+		DSLOGIC_U3PRO32_DEFAULT_CH_MODE_ID : DSLOGIC_PLUS_DEFAULT_CH_MODE_ID;
 	size_t i;
-	for (i = 0; i < ARRAY_SIZE(dslogic_plus_modes); i++)
-		if (dslogic_plus_modes[i].id == id)
-			return &dslogic_plus_modes[i];
+
+	for (i = 0; i < count; i++)
+		if (modes[i].id == default_id)
+			return &modes[i];
+	return &modes[0];
+}
+
+SR_PRIV const struct dslogic_channel_mode *dslogic_channel_mode_by_id(
+		const struct dev_context *devc, uint8_t id)
+{
+	size_t i, count;
+	const struct dslogic_channel_mode *modes = dslogic_channel_modes(devc, &count);
+
+	for (i = 0; i < count; i++)
+		if (modes[i].id == id)
+			return &modes[i];
 	return NULL;
 }
 
@@ -481,8 +589,8 @@ static const struct dslogic_channel_mode *v2_current_channel_mode(const struct d
 {
 	const struct dslogic_channel_mode *m;
 
-	m = dslogic_plus_channel_mode_by_id(devc->ch_mode_id);
-	return m ? m : dslogic_plus_channel_mode_default();
+	m = dslogic_channel_mode_by_id(devc, devc->ch_mode_id);
+	return m ? m : dslogic_channel_mode_default(devc);
 }
 
 /*
@@ -498,11 +606,12 @@ static const struct dslogic_channel_mode *v2_current_channel_mode(const struct d
  * under continuous_mode. Smaller channel counts use less USB bandwidth,
  * letting higher sample rates fit USB 2.0 HS's ~50 MB/s ceiling.
  */
-SR_PRIV uint8_t dslogic_plus_auto_pick_mode_id(uint64_t samplerate,
-		gboolean continuous, gboolean rle, unsigned int need_channels)
+SR_PRIV uint8_t dslogic_auto_pick_mode_id(const struct dev_context *devc,
+		uint64_t samplerate, gboolean continuous, gboolean rle,
+		unsigned int need_channels)
 {
 	size_t i, n;
-	const struct dslogic_channel_mode *modes = dslogic_plus_channel_modes(&n);
+	const struct dslogic_channel_mode *modes = dslogic_channel_modes(devc, &n);
 	const struct dslogic_channel_mode *best = NULL;
 	/*
 	 * stream + RLE relaxes the per-mode max_samplerate cap. Each mode's
@@ -546,7 +655,9 @@ SR_PRIV uint8_t dslogic_plus_auto_pick_mode_id(uint64_t samplerate,
 		if (!best || modes[i].max_samplerate > best->max_samplerate)
 			best = &modes[i];
 	}
-	return best ? best->id : DSLOGIC_PLUS_DEFAULT_CH_MODE_ID;
+	if (best)
+		return best->id;
+	return dslogic_channel_mode_default(devc)->id;
 }
 
 /*
@@ -691,7 +802,7 @@ static void v2_build_default_setting(const struct sr_dev_inst *sdi,
 	 * continuous, so the auto-pick at set-time may have used a stale
 	 * channel count.
 	 */
-	devc->ch_mode_id = dslogic_plus_auto_pick_mode_id(
+	devc->ch_mode_id = dslogic_auto_pick_mode_id(devc,
 		devc->cur_samplerate, devc->continuous_mode, devc->rle_mode,
 		v2_max_enabled_plus_one(sdi));
 	cm = v2_current_channel_mode(devc);
@@ -841,18 +952,24 @@ static void v2_build_default_setting(const struct sr_dev_inst *sdi,
 	 * (degenerate), fall back to ch0.
 	 */
 	{
-		uint16_t cap_mask;
-		uint16_t user_mask = enabled_channel_mask(sdi);
-		if (cm->num_channels >= 16)
-			cap_mask = 0xffff;
+		uint32_t cap_mask;
+		/*
+		 * enabled_channel_mask32() is safe to use unconditionally here
+		 * (not just for DSLOGIC_CAPS_CH32 profiles): a ≤16ch device
+		 * only ever creates ≤16 sr_channels, so the high bits are
+		 * always 0 and this is equivalent to the old 16-bit mask.
+		 */
+		uint32_t user_mask = enabled_channel_mask32(sdi);
+		if (cm->num_channels >= 32)
+			cap_mask = 0xffffffffU;
 		else
-			cap_mask = (uint16_t)((1U << cm->num_channels) - 1U);
+			cap_mask = (1U << cm->num_channels) - 1U;
 		ch_en_mask = user_mask & cap_mask;
 		if (ch_en_mask == 0)
 			ch_en_mask = 1;
 	}
-	s->ch_en_l = (uint16_t)ch_en_mask;
-	s->ch_en_h = 0;
+	s->ch_en_l = (uint16_t)(ch_en_mask & 0xffffU);
+	s->ch_en_h = (uint16_t)(ch_en_mask >> 16);
 
 	/* fgain = 0 (no digital fine gain in logic mode). */
 	s->fgain = 0;
@@ -875,6 +992,43 @@ static void v2_build_default_setting(const struct sr_dev_inst *sdi,
 }
 
 /*
+ * Build the struct DSL_setting_ext32 second arm block, sent only for
+ * DSLOGIC_CAPS_CH32 profiles (U3Pro32) immediately after struct
+ * DSL_setting, carrying channels 16-31's trigger registers (DSL_setting
+ * itself only covers channels 0-15). Mirrors DSView dsl_fpga_arm's
+ * setting_ext32 construction (dsl.c:1021-1055, 1167-1172).
+ *
+ * Real multi-channel-group trigger support for channels 16-31 is out of
+ * scope for this driver's current trigger model (v2_encode_trigger()
+ * only ever encodes stage 0 against channels 0-15, same limitation the
+ * DSLogic Plus V2 path already has). Every stage here is therefore
+ * populated with the hardware's "always true" / don't-care default
+ * (mask=0xffff, value=0, edge=0 - see v2_encode_trigger's doc comment
+ * for the bit semantics), so an enabled channel in 16-31 never blocks
+ * the trigger condition. A future patch adding real multi-channel
+ * trigger support should extend both this and v2_encode_trigger() together.
+ */
+static void v2_build_default_setting_ext32(struct DSL_setting_ext32 *s)
+{
+	int i;
+
+	memset(s, 0, sizeof(*s));
+	s->sync        = DSL_SETTING_EXT32_SYNC;
+	s->end_sync    = DSL_SETTING_EXT32_END_SYNC;
+	s->trig_header = DSL_SETTING_EXT32_TRIG_HEADER;
+	s->align_bytes = DSL_SETTING_EXT32_ALIGN_BYTES;
+
+	for (i = 0; i < NUM_TRIGGER_STAGES; i++) {
+		s->trig_mask0[i] = 0xffff;
+		s->trig_mask1[i] = 0xffff;
+		s->trig_value0[i] = 0;
+		s->trig_value1[i] = 0;
+		s->trig_edge0[i] = 0;
+		s->trig_edge1[i] = 0;
+	}
+}
+
+/*
  * Arm the FPGA by sending struct DSL_setting over bulk endpoint 2.
  *
  * Sequence (dsl.c):
@@ -889,21 +1043,29 @@ static int v2_fpga_config(const struct sr_dev_inst *sdi)
 {
 	struct sr_usb_dev_inst *usb = sdi->conn;
 	libusb_device_handle *hdl = usb->devhdl;
+	struct dev_context *devc = sdi->priv;
 	struct ctl_wr_cmd wr;
 	struct ctl_rd_cmd rd;
 	struct DSL_setting setting;
+	struct DSL_setting_ext32 setting_ext32;
 	uint32_t arm_size;
 	uint8_t rd_data;
 	int ret, transferred;
 
-	/* 1) Set GPIF to word-wide (16-bit) mode (dsl.c). */
-	wr.header.dest   = DSL_CTL_WORDWIDE;
-	wr.header.offset = 0;
-	wr.header.size   = 1;
-	wr.data[0]       = bmWR_WORDWIDE;
-	if ((ret = command_ctl_wr_v2(hdl, wr)) != SR_OK) {
-		sr_err("DSL_CTL_WORDWIDE failed.");
-		return SR_ERR;
+	/*
+	 * 1) Set GPIF to word-wide (16-bit) mode (dsl.c). FX2/HighSpeed-only;
+	 * skipped at USB3 SuperSpeed (see v2_fpga_firmware_upload's step 13
+	 * for why - same DSL fork precedent, dsl.c:1211-1219).
+	 */
+	if (devc->usb_speed != LIBUSB_SPEED_SUPER) {
+		wr.header.dest   = DSL_CTL_WORDWIDE;
+		wr.header.offset = 0;
+		wr.header.size   = 1;
+		wr.data[0]       = bmWR_WORDWIDE;
+		if ((ret = command_ctl_wr_v2(hdl, wr)) != SR_OK) {
+			sr_err("DSL_CTL_WORDWIDE failed.");
+			return SR_ERR;
+		}
 	}
 
 	/*
@@ -945,6 +1107,33 @@ static int v2_fpga_config(const struct sr_dev_inst *sdi)
 		sr_err("Arm FPGA bulk write short: %d/%zu.",
 		       transferred, sizeof(struct DSL_setting));
 		return SR_ERR;
+	}
+
+	/*
+	 * 4b) DSLOGIC_CAPS_CH32 only: bulk-write the second arm block
+	 * covering channels 16-31's trigger registers, immediately after
+	 * struct DSL_setting and still under the same BULK_WR size announce
+	 * / INTRDY handshake (dsl.c sends both blocks before asserting
+	 * INTRDY; the BULK_WR announce above only counts DSL_setting's own
+	 * size, mirroring dsl.c's arm_size calculation).
+	 */
+	if (devc->profile->dev_caps & DSLOGIC_CAPS_CH32) {
+		v2_build_default_setting_ext32(&setting_ext32);
+		transferred = 0;
+		ret = libusb_bulk_transfer(hdl, 2 | LIBUSB_ENDPOINT_OUT,
+					   (unsigned char *)&setting_ext32,
+					   sizeof(struct DSL_setting_ext32),
+					   &transferred, V2_USB_TIMEOUT_MS);
+		if (ret < 0) {
+			sr_err("Arm FPGA bulk write (ext32) failed: %s.",
+			       libusb_error_name(ret));
+			return SR_ERR;
+		}
+		if (transferred != (int)sizeof(struct DSL_setting_ext32)) {
+			sr_err("Arm FPGA bulk write (ext32) short: %d/%zu.",
+			       transferred, sizeof(struct DSL_setting_ext32));
+			return SR_ERR;
+		}
 	}
 
 	/* 5) Assert INTRDY high to signal end of data (dsl.c). */
@@ -1012,9 +1201,15 @@ static int v2_acquisition_stop(const struct sr_dev_inst *sdi)
  * back to a wider mode that covers the highest index in use. */
 static unsigned int v2_max_enabled_plus_one(const struct sr_dev_inst *sdi)
 {
-	uint16_t mask = enabled_channel_mask(sdi);
+	/*
+	 * 32-bit mask + 32-iteration loop covers both the ≤16ch V2 Plus
+	 * family and U3Pro32: the high 16 bits are simply always 0 for a
+	 * device that only ever creates 16 sr_channels, so this is safe for
+	 * both without needing a profile check here.
+	 */
+	uint32_t mask = enabled_channel_mask32(sdi);
 	unsigned int hi = 0, i;
-	for (i = 0; i < 16; i++) {
+	for (i = 0; i < 32; i++) {
 		if (mask & (1U << i))
 			hi = i + 1;
 	}
@@ -1027,7 +1222,7 @@ static int v2_set_samplerate(const struct sr_dev_inst *sdi, uint64_t rate)
 	devc->cur_samplerate = rate;
 	/* Auto-pick the channel mode that fits this rate + enabled-channel
 	 * count under the current stream/buffer choice. */
-	devc->ch_mode_id = dslogic_plus_auto_pick_mode_id(rate,
+	devc->ch_mode_id = dslogic_auto_pick_mode_id(devc, rate,
 		devc->continuous_mode, devc->rle_mode,
 		v2_max_enabled_plus_one(sdi));
 	return SR_OK;

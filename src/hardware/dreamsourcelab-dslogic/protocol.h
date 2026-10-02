@@ -129,6 +129,9 @@ struct dslogic_profile {
 
 	enum dslogic_protocol_version protocol_version;
 	const struct dslogic_protocol_ops *ops;
+
+	/* Number of logic channels this model exposes. */
+	uint16_t num_channels;
 };
 
 struct dev_context {
@@ -136,6 +139,15 @@ struct dev_context {
 	const struct dslogic_protocol_ops *ops;
 	/* V2 only: stable ID of the active channel mode (DSLogic Plus presets). */
 	uint8_t ch_mode_id;
+	/*
+	 * Negotiated USB link speed, queried once in dslogic_dev_open()
+	 * right after libusb_open(). Only meaningful for DSLOGIC_CAPS_USB30
+	 * profiles, which support both a USB3 SuperSpeed link and a
+	 * USB2 HighSpeed fallback link with different achievable streaming
+	 * rates (buffered-mode rates are link-speed independent). Unset
+	 * (LIBUSB_SPEED_UNKNOWN) for every other profile.
+	 */
+	enum libusb_speed usb_speed;
 	/*
 	 * Since we can't keep track of a DSLogic device after upgrading
 	 * the firmware (it renumerates into a different device address
@@ -213,6 +225,7 @@ struct dev_context {
 SR_PRIV int fpga_configure(const struct sr_dev_inst *sdi);
 SR_PRIV unsigned int enabled_channel_count(const struct sr_dev_inst *sdi);
 SR_PRIV uint16_t enabled_channel_mask(const struct sr_dev_inst *sdi);
+SR_PRIV uint32_t enabled_channel_mask32(const struct sr_dev_inst *sdi);
 SR_PRIV int dslogic_fpga_firmware_upload(const struct sr_dev_inst *sdi);
 SR_PRIV int dslogic_set_voltage_threshold(const struct sr_dev_inst *sdi, double threshold);
 SR_PRIV int dslogic_dev_open(struct sr_dev_inst *sdi, struct sr_dev_driver *di);

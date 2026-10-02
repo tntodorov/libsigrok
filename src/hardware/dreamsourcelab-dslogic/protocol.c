@@ -336,6 +336,25 @@ SR_PRIV uint16_t enabled_channel_mask(const struct sr_dev_inst *sdi)
 }
 
 /*
+ * 32-bit sibling of enabled_channel_mask(), for DSLOGIC_CAPS_CH32 devices
+ * (currently only DSLogic U3Pro32) whose channel index can exceed 15.
+ * enabled_channel_mask() itself stays 16-bit and untouched: V1's legacy
+ * struct fpga_config.ch_en is a real uint16_t wire field, and every other
+ * V2 profile tops out at 16 channels too, so there's no reason to touch
+ * their code path.
+ */
+SR_PRIV uint32_t enabled_channel_mask32(const struct sr_dev_inst *sdi)
+{
+	uint32_t mask = 0;
+	for (const GSList *l = sdi->channels; l; l = l->next) {
+		const struct sr_channel *const probe = (struct sr_channel *)l->data;
+		if (probe->enabled)
+			mask |= 1U << probe->index;
+	}
+	return mask;
+}
+
+/*
  * Get the session trigger and configure the FPGA structure
  * accordingly.
  * @return @c true if any triggers are enabled, @c false otherwise.
@@ -584,6 +603,7 @@ SR_PRIV int dslogic_dev_open(struct sr_dev_inst *sdi, struct sr_dev_driver *di)
 				 * upload, so we don't know the address yet.
 				 */
 				usb->address = libusb_get_device_address(devlist[i]);
+			devc->usb_speed = libusb_get_device_speed(devlist[i]);
 		} else {
 			sr_err("Failed to open device: %s.",
 			       libusb_error_name(ret));
@@ -693,8 +713,15 @@ SR_PRIV struct dev_context *dslogic_dev_new(void)
 	devc->capture_ratio = 0;
 	devc->continuous_mode = FALSE;
 	devc->clock_edge = DS_EDGE_RISING;
-	/* DSLogic Plus default: 16 channels, buffered, max 100 MHz. */
-	devc->ch_mode_id = dslogic_plus_channel_mode_default()->id;
+	/*
+	 * Default channel-mode id. devc->profile isn't assigned yet at this
+	 * point (scan() sets it right after this call returns), so we can't
+	 * look up a real default here. 0 is each V2 family's own default
+	 * entry id (see DSLOGIC_PLUS_DEFAULT_CH_MODE_ID /
+	 * DSLOGIC_U3PRO32_DEFAULT_CH_MODE_ID in protocol_v2.c); V1 devices
+	 * ignore ch_mode_id entirely.
+	 */
+	devc->ch_mode_id = 0;
 
 	return devc;
 }

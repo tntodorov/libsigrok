@@ -79,6 +79,14 @@
 #define SECU_EEP_ADDR   0x3C00
 #define SECU_TRY_CNT    8
 
+/*
+ * Per-profile capability flags (struct dslogic_profile.dev_caps).
+ * Unused (0) by every V1 device and by the V2 DSLogic Plus Pango
+ * profile; U3Pro32 is the first entry to populate these.
+ */
+#define DSLOGIC_CAPS_CH32   (1 << 0)  /* 32 logic channels (needs DSL_setting_ext32). */
+#define DSLOGIC_CAPS_USB30  (1 << 1)  /* USB3 SuperSpeed: skip GPIF WORDWIDE, wider transfers. */
+
 /* Trigger / setting blob (mirrors DSView dsl.h). */
 #ifndef NUM_TRIGGER_STAGES
 #define NUM_TRIGGER_STAGES   16
@@ -127,11 +135,36 @@ struct DSL_setting {
 	uint32_t end_sync;
 };
 
+/*
+ * Second arm block, sent immediately after struct DSL_setting, only for
+ * DSLOGIC_CAPS_CH32 profiles. Carries trigger mask/value/edge registers
+ * for logic channels 16-31 (DSL_setting above only covers channels 0-15).
+ * Mirrors DSView's struct DSL_setting_ext32 (dsl.h).
+ */
+struct DSL_setting_ext32 {
+	uint32_t sync;
+	uint16_t trig_header;
+	uint16_t trig_mask0[NUM_TRIGGER_STAGES];
+	uint16_t trig_mask1[NUM_TRIGGER_STAGES];
+	uint16_t trig_value0[NUM_TRIGGER_STAGES];
+	uint16_t trig_value1[NUM_TRIGGER_STAGES];
+	uint16_t trig_edge0[NUM_TRIGGER_STAGES];
+	uint16_t trig_edge1[NUM_TRIGGER_STAGES];
+	uint16_t align_bytes;
+	uint32_t end_sync;
+};
+
 #pragma pack(pop)
 
 /* Sync markers used by DSL_setting (mirrors DSView dsl.c constants). */
 #define DSL_SETTING_SYNC      0xf5a5f5a5
 #define DSL_SETTING_END_SYNC  0xfa5afa5a
+
+/* Sync markers / header used by DSL_setting_ext32 (mirrors DSView dsl.c). */
+#define DSL_SETTING_EXT32_SYNC        0xf5a5f5a5
+#define DSL_SETTING_EXT32_END_SYNC    0xfa5afa5a
+#define DSL_SETTING_EXT32_TRIG_HEADER 0x6060
+#define DSL_SETTING_EXT32_ALIGN_BYTES 0xffff
 
 /*
  * Bit positions within DSL_setting.mode (mirrors DSView dsl.c).
@@ -167,11 +200,24 @@ struct dslogic_channel_mode {
 	const char *descr;
 };
 
-SR_PRIV const struct dslogic_channel_mode *dslogic_plus_channel_modes(size_t *count);
-SR_PRIV const struct dslogic_channel_mode *dslogic_plus_channel_mode_default(void);
-SR_PRIV const struct dslogic_channel_mode *dslogic_plus_channel_mode_by_id(uint8_t id);
-SR_PRIV uint8_t dslogic_plus_auto_pick_mode_id(uint64_t samplerate,
-		gboolean continuous, gboolean rle, unsigned int need_channels);
+/*
+ * Channel-mode table lookups, dispatched per profile: DSLOGIC_CAPS_CH32
+ * profiles (U3Pro32) get the 32-channel table (itself split further by
+ * devc->usb_speed, since streaming rates differ sharply between the
+ * USB3 SuperSpeed link and the USB2 HighSpeed fallback link), everything
+ * else V2 (the DSLogic Plus Pango family) gets the original
+ * 16-channel-max table. Take struct dev_context, not just the profile,
+ * because the USB3-vs-HighSpeed table split needs devc->usb_speed.
+ */
+SR_PRIV const struct dslogic_channel_mode *dslogic_channel_modes(
+		const struct dev_context *devc, size_t *count);
+SR_PRIV const struct dslogic_channel_mode *dslogic_channel_mode_default(
+		const struct dev_context *devc);
+SR_PRIV const struct dslogic_channel_mode *dslogic_channel_mode_by_id(
+		const struct dev_context *devc, uint8_t id);
+SR_PRIV uint8_t dslogic_auto_pick_mode_id(const struct dev_context *devc,
+		uint64_t samplerate, gboolean continuous, gboolean rle,
+		unsigned int need_channels);
 
 /* Transport primitives. */
 SR_PRIV int command_ctl_wr_v2(libusb_device_handle *devhdl, struct ctl_wr_cmd cmd);

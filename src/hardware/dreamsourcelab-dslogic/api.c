@@ -28,32 +28,38 @@ static const struct dslogic_profile supported_device[] = {
 	{ 0x2a0e, 0x0001, "DreamSourceLab", "DSLogic", NULL,
 		"dreamsourcelab-dslogic-fx2.fw",
 		0, "DreamSourceLab", "DSLogic", 256 * 1024 * 1024,
-		DSL_PROTO_V1, &dslogic_v1_ops},
+		DSL_PROTO_V1, &dslogic_v1_ops, 16},
 	/* DreamSourceLab DSCope */
 	{ 0x2a0e, 0x0002, "DreamSourceLab", "DSCope", NULL,
 		"dreamsourcelab-dscope-fx2.fw",
 		0, "DreamSourceLab", "DSCope", 256 * 1024 * 1024,
-		DSL_PROTO_V1, &dslogic_v1_ops},
+		DSL_PROTO_V1, &dslogic_v1_ops, 16},
 	/* DreamSourceLab DSLogic Pro */
 	{ 0x2a0e, 0x0003, "DreamSourceLab", "DSLogic Pro", NULL,
 		"dreamsourcelab-dslogic-pro-fx2.fw",
 		0, "DreamSourceLab", "DSLogic", 256 * 1024 * 1024,
-		DSL_PROTO_V1, &dslogic_v1_ops},
+		DSL_PROTO_V1, &dslogic_v1_ops, 16},
 	/* DreamSourceLab DSLogic Plus */
 	{ 0x2a0e, 0x0020, "DreamSourceLab", "DSLogic Plus", NULL,
 		"dreamsourcelab-dslogic-plus-fx2.fw",
 		0, "DreamSourceLab", "DSLogic", 256 * 1024 * 1024,
-		DSL_PROTO_V1, &dslogic_v1_ops},
+		DSL_PROTO_V1, &dslogic_v1_ops, 16},
 	/* DreamSourceLab DSLogic Plus (hardware revision, PID 0x0034) */
 	{ 0x2a0e, 0x0034, "DreamSourceLab", "DSLogic Plus", NULL,
 		"dreamsourcelab-dslogic-plus-fx2.fw",
 		0, "DreamSourceLab", "DSLogic", 256 * 1024 * 1024,
-		DSL_PROTO_V2, &dslogic_v2_ops},
+		DSL_PROTO_V2, &dslogic_v2_ops, 16},
 	/* DreamSourceLab DSLogic Basic */
 	{ 0x2a0e, 0x0021, "DreamSourceLab", "DSLogic Basic", NULL,
 		"dreamsourcelab-dslogic-basic-fx2.fw",
 		0, "DreamSourceLab", "DSLogic", 256 * 1024,
-		DSL_PROTO_V1, &dslogic_v1_ops},
+		DSL_PROTO_V1, &dslogic_v1_ops, 16},
+	/* DreamSourceLab DSLogic U3Pro32 */
+	{ 0x2a0e, 0x002c, "DreamSourceLab", "DSLogic U3Pro32", NULL,
+		"dreamsourcelab-dslogic-u3pro32-fx3.fw",
+		DSLOGIC_CAPS_CH32 | DSLOGIC_CAPS_USB30,
+		"DreamSourceLab", "DSLogic", 2U * 1024 * 1024 * 1024,
+		DSL_PROTO_V2, &dslogic_v2_ops, 32},
 
 	ALL_ZERO
 };
@@ -255,7 +261,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 
 		/* Logic channels, all in one channel group. */
 		cg = sr_channel_group_new(sdi, "Logic", NULL);
-		for (j = 0; j < NUM_CHANNELS; j++) {
+		for (j = 0; j < prof->num_channels; j++) {
 			sprintf(channel_name, "%d", j);
 			ch = sr_channel_new(sdi, j, SR_CHANNEL_LOGIC,
 						TRUE, channel_name);
@@ -566,11 +572,11 @@ static int config_set(uint32_t key, GVariant *data,
 			/* Re-pick the channel mode for the new stream/buffer
 			 * choice; uses current samplerate + enabled-channel
 			 * count as hints. */
-			uint16_t m = enabled_channel_mask(sdi);
+			uint32_t m = enabled_channel_mask32(sdi);
 			unsigned int hi = 0, i;
-			for (i = 0; i < 16; i++)
+			for (i = 0; i < 32; i++)
 				if (m & (1U << i)) hi = i + 1;
-			devc->ch_mode_id = dslogic_plus_auto_pick_mode_id(
+			devc->ch_mode_id = dslogic_auto_pick_mode_id(devc,
 				devc->cur_samplerate, devc->continuous_mode,
 				devc->rle_mode, hi ? hi : 1);
 		}
