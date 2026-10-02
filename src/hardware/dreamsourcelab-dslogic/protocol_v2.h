@@ -84,8 +84,9 @@
  * Unused (0) by every V1 device and by the V2 DSLogic Plus Pango
  * profile; U3Pro32 is the first entry to populate these.
  */
-#define DSLOGIC_CAPS_CH32   (1 << 0)  /* 32 logic channels (needs DSL_setting_ext32). */
-#define DSLOGIC_CAPS_USB30  (1 << 1)  /* USB3 SuperSpeed: skip GPIF WORDWIDE, wider transfers. */
+#define DSLOGIC_CAPS_CH32     (1 << 0)  /* 32 logic channels (needs DSL_setting_ext32). */
+#define DSLOGIC_CAPS_USB30    (1 << 1)  /* USB3 SuperSpeed: skip GPIF WORDWIDE, wider transfers. */
+#define DSLOGIC_CAPS_SECURITY (1 << 2)  /* Anti-clone EEPROM challenge-response at dev_open. */
 
 /* Trigger / setting blob (mirrors DSView dsl.h). */
 #ifndef NUM_TRIGGER_STAGES

@@ -355,6 +355,26 @@ SR_PRIV uint32_t enabled_channel_mask32(const struct sr_dev_inst *sdi)
 }
 
 /*
+ * Size of the trigger-position header packet the device sends on EP6 IN
+ * right after a capture completes. Mirrors DSView's dsl_header_size()
+ * (dsl.c): CAPS_FEATURE_USB30 devices send a 1KB header, everything else
+ * 512 bytes. struct dslogic_trigger_pos's real fields all live in the
+ * first 512 bytes regardless; the extra 512 bytes on USB30 devices are
+ * padding we still have to size the read buffer/request for, or the
+ * device's actual send (which DSView itself always sizes via this same
+ * function, not a fixed struct size) silently never completes - the
+ * trigger acquisition "hangs" with the header packet never arriving,
+ * since the device is trying to send more than we asked to receive.
+ * Confirmed root cause via USB capture against real U3Pro32 hardware.
+ */
+SR_PRIV int dslogic_header_size(const struct dev_context *devc)
+{
+	if (devc->profile->dev_caps & DSLOGIC_CAPS_USB30)
+		return 1024;
+	return 512;
+}
+
+/*
  * Get the session trigger and configure the FPGA structure
  * accordingly.
  * @return @c true if any triggers are enabled, @c false otherwise.
@@ -790,15 +810,18 @@ static void rearm_chunk_in_place(struct sr_dev_inst *sdi)
 		goto fail;
 	if ((ret = devc->ops->fpga_config(sdi)) != SR_OK)
 		goto fail;
-	if ((ret = devc->ops->acquisition_start(sdi)) != SR_OK)
-		goto fail;
 
-	tpos = g_malloc(sizeof(struct dslogic_trigger_pos));
+	/*
+	 * Post the header-read URB before DSL_CTL_START, not after - see
+	 * the comment in dslogic_acquisition_start() for why (missed
+	 * one-shot header packet on fast captures).
+	 */
+	tpos = g_malloc0(dslogic_header_size(devc));
 	transfer = libusb_alloc_transfer(0);
 	libusb_fill_bulk_transfer(transfer, usb->devhdl,
 			6 | LIBUSB_ENDPOINT_IN,
 			(unsigned char *)tpos,
-			sizeof(struct dslogic_trigger_pos),
+			dslogic_header_size(devc),
 			trigger_receive, (void *)sdi, 0);
 	if ((ret = libusb_submit_transfer(transfer)) < 0) {
 		sr_err("Re-arm trigger transfer submit failed: %s.",
@@ -816,6 +839,9 @@ static void rearm_chunk_in_place(struct sr_dev_inst *sdi)
 	devc->num_transfers = 1;
 	devc->submitted_transfers++;
 	devc->transfers[0] = transfer;
+
+	if ((ret = devc->ops->acquisition_start(sdi)) != SR_OK)
+		goto fail;
 
 	sr_dbg("Re-armed chunk in %.2f ms.",
 	       (g_get_monotonic_time() - t_start_us) / 1000.0);
@@ -1289,7 +1315,7 @@ static void LIBUSB_CALL trigger_receive(struct libusb_transfer *transfer)
 		devc->num_transfers = 0;
 		g_free(devc->transfers);
 	} else if (transfer->status == LIBUSB_TRANSFER_COMPLETED
-			&& transfer->actual_length == sizeof(struct dslogic_trigger_pos)) {
+			&& transfer->actual_length == dslogic_header_size(devc)) {
 		tpos = (struct dslogic_trigger_pos *)transfer->buffer;
 		sr_info("tpos real_pos %d ram_saddr %d cnt_h %d cnt_l %d", tpos->real_pos,
 			tpos->ram_saddr, tpos->remain_cnt_h, tpos->remain_cnt_l);
@@ -1399,21 +1425,28 @@ SR_PRIV int dslogic_acquisition_start(const struct sr_dev_inst *sdi)
 	std_session_send_df_header(sdi);
 
 	/* Stop any prior acquisition, then arm and start. Matches DSView's order
-	 * at dslogic.c (STOP -> arm -> START). */
+	 * at dslogic.c (STOP -> arm -> submit header-read transfer -> START):
+	 * DSView's dsl_start_transfers() submits the EP6 IN read(s) BEFORE
+	 * the DSL_CTL_START write, not after. The device fires its one-shot
+	 * trigger-position header packet as soon as it finishes capturing,
+	 * with no retry if nobody was listening; for a short/fast capture
+	 * (e.g. 1000 samples at 1 MHz = ~1ms), the device can finish and
+	 * send that packet before we'd otherwise get around to posting the
+	 * read URB, permanently hanging the acquisition. Posting the read
+	 * before START closes that race. Confirmed against real U3Pro32
+	 * hardware: this exact ordering bug reproduced a hang after "Arm
+	 * FPGA done." with no further progress. */
 	if ((ret = devc->ops->acquisition_stop(sdi)) != SR_OK)
 		return ret;
 
 	if ((ret = devc->ops->fpga_config(sdi)) != SR_OK)
 		return ret;
 
-	if ((ret = devc->ops->acquisition_start(sdi)) != SR_OK)
-		return ret;
-
 	sr_dbg("Getting trigger.");
-	tpos = g_malloc(sizeof(struct dslogic_trigger_pos));
+	tpos = g_malloc0(dslogic_header_size(devc));
 	transfer = libusb_alloc_transfer(0);
 	libusb_fill_bulk_transfer(transfer, usb->devhdl, 6 | LIBUSB_ENDPOINT_IN,
-			(unsigned char *)tpos, sizeof(struct dslogic_trigger_pos),
+			(unsigned char *)tpos, dslogic_header_size(devc),
 			trigger_receive, (void *)sdi, 0);
 	if ((ret = libusb_submit_transfer(transfer)) < 0) {
 		sr_err("Failed to request trigger: %s.", libusb_error_name(ret));
@@ -1430,6 +1463,14 @@ SR_PRIV int dslogic_acquisition_start(const struct sr_dev_inst *sdi)
 	devc->num_transfers = 1;
 	devc->submitted_transfers++;
 	devc->transfers[0] = transfer;
+
+	/*
+	 * Only now, with the header-read URB already posted, tell the FPGA
+	 * to go. See the comment above acquisition_stop()/fpga_config() for
+	 * why this must come after, not before, the transfer submission.
+	 */
+	if ((ret = devc->ops->acquisition_start(sdi)) != SR_OK)
+		return ret;
 
 	return ret;
 }

@@ -47,7 +47,7 @@ static const struct dslogic_profile supported_device[] = {
 	/* DreamSourceLab DSLogic Plus (hardware revision, PID 0x0034) */
 	{ 0x2a0e, 0x0034, "DreamSourceLab", "DSLogic Plus", NULL,
 		"dreamsourcelab-dslogic-plus-fx2.fw",
-		0, "DreamSourceLab", "DSLogic", 256 * 1024 * 1024,
+		DSLOGIC_CAPS_SECURITY, "DreamSourceLab", "DSLogic", 256 * 1024 * 1024,
 		DSL_PROTO_V2, &dslogic_v2_ops, 16},
 	/* DreamSourceLab DSLogic Basic */
 	{ 0x2a0e, 0x0021, "DreamSourceLab", "DSLogic Basic", NULL,

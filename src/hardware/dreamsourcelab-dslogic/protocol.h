@@ -226,6 +226,7 @@ SR_PRIV int fpga_configure(const struct sr_dev_inst *sdi);
 SR_PRIV unsigned int enabled_channel_count(const struct sr_dev_inst *sdi);
 SR_PRIV uint16_t enabled_channel_mask(const struct sr_dev_inst *sdi);
 SR_PRIV uint32_t enabled_channel_mask32(const struct sr_dev_inst *sdi);
+SR_PRIV int dslogic_header_size(const struct dev_context *devc);
 SR_PRIV int dslogic_fpga_firmware_upload(const struct sr_dev_inst *sdi);
 SR_PRIV int dslogic_set_voltage_threshold(const struct sr_dev_inst *sdi, double threshold);
 SR_PRIV int dslogic_dev_open(struct sr_dev_inst *sdi, struct sr_dev_driver *di);

@@ -187,9 +187,21 @@ static uint16_t v2_secu_read(const struct sr_dev_inst *sdi)
 
 static int v2_security_check(const struct sr_dev_inst *sdi)
 {
+	struct dev_context *devc = sdi->priv;
 	uint16_t encryption[SECU_STEPS];
 	int i;
 	int try_cnt;
+
+	/*
+	 * Only the DSLogic Plus Pango revision (PID 0x0034) implements this
+	 * anti-clone EEPROM challenge-response; U3Pro32 and any future
+	 * DSLOGIC_CAPS_SECURITY-less V2 profile don't have the circuitry
+	 * for it at all, and calling this against them times out waiting
+	 * for a "ready" bit that will never be set (confirmed on real
+	 * U3Pro32 hardware: "Security ready timeout at step 7").
+	 */
+	if (!(devc->profile->dev_caps & DSLOGIC_CAPS_SECURITY))
+		return SR_OK;
 
 	/* "Dessert clear" - DSView writes CTR0_ADDR=0x70 to 0 before the
 	 * encryption read (dsl.c). Without this the FPGA can be left in
