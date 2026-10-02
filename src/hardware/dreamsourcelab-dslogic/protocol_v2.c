@@ -496,11 +496,11 @@ static const struct dslogic_channel_mode dslogic_plus_modes[] = {
  */
 static const struct dslogic_channel_mode dslogic_u3pro32_hs_modes[] = {
 	/* id  stream  ch  min_sr       max_sr       hw_max      pre  descr */
-	{   0, FALSE,  32, SR_MHZ(1),   SR_MHZ(250), SR_MHZ(250), 1,
+	{   0, FALSE,  32, SR_MHZ(1),   SR_MHZ(250), SR_MHZ(500), 5,
 		"32 channels, buffered (max 250 MHz)" },
-	{   1, FALSE,  16, SR_MHZ(1),   SR_MHZ(500), SR_MHZ(500), 1,
+	{   1, FALSE,  16, SR_MHZ(1),   SR_MHZ(500), SR_MHZ(500), 5,
 		"16 channels, buffered (max 500 MHz)" },
-	{   2, FALSE,   8, SR_MHZ(1),   SR_GHZ(1),   SR_GHZ(1),   1,
+	{   2, FALSE,   8, SR_MHZ(1),   SR_GHZ(1),   SR_MHZ(500), 5,
 		"8 channels, buffered (max 1 GHz)" },
 	{   3, TRUE,   32, SR_KHZ(100), SR_MHZ(10),  SR_MHZ(500), 5,
 		"32 channels, streaming (max 10 MHz)" },
@@ -516,11 +516,11 @@ static const struct dslogic_channel_mode dslogic_u3pro32_hs_modes[] = {
 
 static const struct dslogic_channel_mode dslogic_u3pro32_ss_modes[] = {
 	/* id  stream  ch  min_sr      max_sr       hw_max      pre  descr */
-	{   0, FALSE,  32, SR_MHZ(1),  SR_MHZ(250), SR_MHZ(250), 1,
+	{   0, FALSE,  32, SR_MHZ(1),  SR_MHZ(250), SR_MHZ(500), 5,
 		"32 channels, buffered (max 250 MHz)" },
-	{   1, FALSE,  16, SR_MHZ(1),  SR_MHZ(500), SR_MHZ(500), 1,
+	{   1, FALSE,  16, SR_MHZ(1),  SR_MHZ(500), SR_MHZ(500), 5,
 		"16 channels, buffered (max 500 MHz)" },
-	{   2, FALSE,   8, SR_MHZ(1),  SR_GHZ(1),   SR_GHZ(1),   1,
+	{   2, FALSE,   8, SR_MHZ(1),  SR_GHZ(1),   SR_MHZ(500), 5,
 		"8 channels, buffered (max 1 GHz)" },
 	{   3, TRUE,   32, SR_MHZ(1),  SR_MHZ(50),  SR_MHZ(500), 5,
 		"32 channels, streaming (max 50 MHz)" },
