@@ -796,6 +796,7 @@ static void rearm_chunk_in_place(struct sr_dev_inst *sdi)
 	devc->sent_samples = 0;
 	devc->actual_samples = 0;
 	devc->empty_transfer_count = 0;
+	devc->leftover_len = 0;
 	devc->wallclock_deadline_us = 0;
 
 	g_free(devc->transfers);
@@ -992,22 +993,14 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 	const size_t channel_count = enabled_channel_count(sdi);
 	const uint32_t channel_mask = enabled_channel_mask32(sdi);
 	const unsigned int unitsize = devc->sample_unitsize;
-	/*
-	 * Must match deinterleave_buffer()'s "complete blocks only" count
-	 * exactly: (ATOMIC_SAMPLES * actual_length) / (ATOMIC_BYTES *
-	 * channel_count), evaluated as a single division, can round UP
-	 * relative to floor(actual_length / (ATOMIC_BYTES * channel_count))
-	 * * ATOMIC_SAMPLES when actual_length isn't an exact multiple of
-	 * ATOMIC_BYTES * channel_count - over-reporting how many samples
-	 * were actually written and reading past the end of
-	 * devc->deinterleave_buffer in send_data(). Divide first.
-	 */
-	const unsigned int cur_sample_count = DSLOGIC_ATOMIC_SAMPLES *
-		(transfer->actual_length / (DSLOGIC_ATOMIC_BYTES * channel_count));
 
 	gboolean packet_has_error = FALSE;
 	unsigned int num_samples;
+	unsigned int cur_sample_count;
 	int trigger_offset;
+	const uint8_t *proc_buf;
+	uint8_t *combined = NULL;
+	size_t proc_len;
 
 	/*
 	 * If acquisition has already ended, just free any queued up
@@ -1108,6 +1101,43 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 	}
 
 	/*
+	 * Splice in any trailing partial-block bytes carried over from the
+	 * previous transfer, so the atomic-block parsing below sees the
+	 * device's continuous byte stream rather than restarting alignment
+	 * from zero at an arbitrary transfer boundary. Without this, a
+	 * transfer length that isn't an exact multiple of the atomic block
+	 * size (common whenever the enabled channel count doesn't evenly
+	 * divide the fixed buffered-mode buffer size, e.g. 1048576 % (3*8)
+	 * != 0 for 3 channels) desyncs every subsequent transfer by a few
+	 * bytes - which manifests as sample data appearing to "shift" to
+	 * the wrong channel partway through a multi-transfer capture.
+	 */
+	if (devc->leftover_len) {
+		proc_len = devc->leftover_len + transfer->actual_length;
+		combined = g_malloc(proc_len);
+		memcpy(combined, devc->leftover_buf, devc->leftover_len);
+		memcpy(combined + devc->leftover_len, transfer->buffer,
+			transfer->actual_length);
+		proc_buf = combined;
+	} else {
+		proc_buf = transfer->buffer;
+		proc_len = transfer->actual_length;
+	}
+
+	/*
+	 * Must match deinterleave_buffer()'s "complete blocks only" count
+	 * exactly: (ATOMIC_SAMPLES * proc_len) / (ATOMIC_BYTES *
+	 * channel_count), evaluated as a single division, can round UP
+	 * relative to floor(proc_len / (ATOMIC_BYTES * channel_count))
+	 * * ATOMIC_SAMPLES when proc_len isn't an exact multiple of
+	 * ATOMIC_BYTES * channel_count - over-reporting how many samples
+	 * were actually written and reading past the end of
+	 * devc->deinterleave_buffer in send_data(). Divide first.
+	 */
+	cur_sample_count = DSLOGIC_ATOMIC_SAMPLES *
+		(proc_len / (DSLOGIC_ATOMIC_BYTES * channel_count));
+
+	/*
 	 * The acquisition-stop budget is actual_samples (= limit_samples for
 	 * normal captures, possibly less under RLE). Falls back to limit_samples
 	 * if the trigger-position header has not arrived yet (actual_samples
@@ -1133,16 +1163,17 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 		 *
 		 * Hopefully in future it will be possible to pass the data on as-is.
 		 */
-		if (transfer->actual_length % (DSLOGIC_ATOMIC_BYTES * channel_count) != 0)
-			sr_dbg("Transfer length %d isn't a multiple of the "
+		if (proc_len % (DSLOGIC_ATOMIC_BYTES * channel_count) != 0)
+			sr_dbg("Combined length %zu isn't a multiple of the "
 				"atomic block size (%zu bytes for %zu "
-				"channels); trailing partial block dropped. "
-				"Expected whenever the fixed buffered-mode "
-				"buffer size doesn't evenly divide by the "
-				"enabled channel count - not an error.",
-				transfer->actual_length,
+				"channels); trailing partial block carried "
+				"over to the next transfer. Expected "
+				"whenever the fixed buffered-mode buffer "
+				"size doesn't evenly divide by the enabled "
+				"channel count - not an error.",
+				proc_len,
 				DSLOGIC_ATOMIC_BYTES * channel_count, channel_count);
-		deinterleave_buffer(transfer->buffer, transfer->actual_length,
+		deinterleave_buffer(proc_buf, proc_len,
 			devc->deinterleave_buffer, channel_count, channel_mask,
 			unitsize);
 
@@ -1166,7 +1197,14 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 			send_data(sdi, devc->deinterleave_buffer, num_samples, unitsize);
 			devc->sent_samples += num_samples;
 		}
+
+		devc->leftover_len = proc_len % (DSLOGIC_ATOMIC_BYTES * channel_count);
+		if (devc->leftover_len)
+			memcpy(devc->leftover_buf,
+				proc_buf + (proc_len - devc->leftover_len),
+				devc->leftover_len);
 	}
+	g_free(combined);
 
 	if (budget && devc->sent_samples >= budget) {
 		/* Per-chunk budget consumed. In chunk_loop, queue a re-arm
@@ -1328,6 +1366,7 @@ static int start_transfers(const struct sr_dev_inst *sdi)
 	devc->sent_samples = 0;
 	devc->acq_aborted = FALSE;
 	devc->empty_transfer_count = 0;
+	devc->leftover_len = 0;
 	devc->submitted_transfers = 0;
 	devc->wallclock_deadline_us = 0;
 
@@ -1341,8 +1380,15 @@ static int start_transfers(const struct sr_dev_inst *sdi)
 	/* 2 bytes/sample for <=16 enabled channels (every existing V1/V2
 	 * device), 4 bytes for >16 (DSLOGIC_CAPS_CH32 profiles only). */
 	devc->sample_unitsize = (channel_count > 16) ? 4 : 2;
+	/*
+	 * +1 block of headroom: receive_transfer() prepends up to one
+	 * atomic block's worth of carried-over leftover bytes from the
+	 * previous transfer before deinterleaving, so a single call can
+	 * yield one more complete block than this transfer's own size
+	 * alone would account for.
+	 */
 	devc->deinterleave_buffer = g_try_malloc(DSLOGIC_ATOMIC_SAMPLES *
-		(size / (channel_count * DSLOGIC_ATOMIC_BYTES)) * devc->sample_unitsize);
+		(size / (channel_count * DSLOGIC_ATOMIC_BYTES) + 1) * devc->sample_unitsize);
 	if (!devc->deinterleave_buffer) {
 		sr_err("Deinterleave buffer malloc failed.");
 		g_free(devc->deinterleave_buffer);
@@ -1468,6 +1514,7 @@ SR_PRIV int dslogic_acquisition_start(const struct sr_dev_inst *sdi)
 	devc->sent_samples = 0;
 	devc->actual_samples = 0;
 	devc->empty_transfer_count = 0;
+	devc->leftover_len = 0;
 	devc->acq_aborted = FALSE;
 	devc->rearm_pending = FALSE;
 	devc->wallclock_deadline_us = 0;

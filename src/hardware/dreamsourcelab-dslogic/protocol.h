@@ -205,6 +205,20 @@ struct dev_context {
 	int submitted_transfers;
 	int empty_transfer_count;
 
+	/*
+	 * Trailing bytes left over from the previous transfer that didn't
+	 * form a complete channel_count*8-byte atomic block, carried
+	 * forward so the next transfer's parsing starts from the correct
+	 * byte-stream position instead of silently resyncing to a wrong
+	 * offset. Only non-empty when the enabled channel count doesn't
+	 * evenly divide the (fixed-size) buffered-mode transfer buffer -
+	 * e.g. 1048576 % (3 * 8) != 0 for 3 enabled channels. Max size is
+	 * one atomic block for the widest supported channel count (32 ch
+	 * * 8 bytes = 256) minus one byte.
+	 */
+	uint8_t leftover_buf[256];
+	unsigned int leftover_len;
+
 	unsigned int num_transfers;
 	struct libusb_transfer **transfers;
 	struct sr_context *ctx;
