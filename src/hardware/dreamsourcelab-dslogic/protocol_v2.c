@@ -113,6 +113,61 @@ SR_PRIV int dsl_rd_nvm_v2(const struct sr_dev_inst *sdi, uint8_t *buf, uint16_t 
 	return command_ctl_rd_v2(usb->devhdl, rd_cmd);
 }
 
+/*
+ * ADC clock-config table, mirrors DSView's adc_clk_init_500m (dsl.h).
+ * Each row: {dest, cnt, delay_ms, byte[4]}. dsl_config_adc()'s loop
+ * (dsl.c) sleeps delay_ms *before* writing this row's first `cnt`
+ * bytes to `dest`, one byte per DSL_CTL_I2C_REG write, then moves to
+ * the next row; a dest==0 row terminates the table.
+ */
+struct dslogic_adc_config {
+	uint8_t dest;
+	uint8_t cnt;
+	uint8_t delay_ms;
+	uint8_t byte[4];
+};
+
+static const struct dslogic_adc_config adc_clk_init_500m[] = {
+	{ ADCC_ADDR + 2, 1, 0,  { 0x01, 0x00, 0x00, 0x00 } }, /* ADC clock power up */
+	{ ADCC_ADDR,     4, 0,  { 0x01, 0x61, 0x00, 0x30 } },
+	{ ADCC_ADDR,     4, 0,  { 0x01, 0x40, 0xf1, 0x46 } },
+	{ ADCC_ADDR,     4, 10, { 0x01, 0x62, 0x3d, 0x40 } },
+	{ 0, 0, 0, { 0, 0, 0, 0 } },
+};
+
+SR_PRIV int dslogic_config_adc_v2(const struct sr_dev_inst *sdi)
+{
+	const struct dslogic_adc_config *cfg;
+	int i;
+
+	for (cfg = adc_clk_init_500m; cfg->dest; cfg++) {
+		if (cfg->delay_ms > 0)
+			g_usleep(cfg->delay_ms * 1000);
+		for (i = 0; i < cfg->cnt; i++)
+			dsl_wr_reg_v2(sdi, cfg->dest, cfg->byte[i]);
+	}
+	return SR_OK;
+}
+
+SR_PRIV int dslogic_hdl_version_v2(const struct sr_dev_inst *sdi, uint8_t *value)
+{
+	struct sr_usb_dev_inst *usb = sdi->conn;
+	struct ctl_rd_cmd rd_cmd;
+	uint8_t rdata[HDL_VERSION_ADDR + 1];
+	int ret;
+
+	rd_cmd.header.dest   = DSL_CTL_I2C_STATUS;
+	rd_cmd.header.offset = 0;
+	rd_cmd.header.size   = HDL_VERSION_ADDR + 1;
+	rd_cmd.data          = rdata;
+	if ((ret = command_ctl_rd_v2(usb->devhdl, rd_cmd)) != SR_OK) {
+		sr_err("Sent DSL_CTL_I2C_STATUS command failed.");
+		return ret;
+	}
+	*value = rdata[HDL_VERSION_ADDR];
+	return SR_OK;
+}
+
 SR_PRIV int dsl_wait_hw_status_bit_v2(libusb_device_handle *hdl, uint8_t bit_mask, gboolean want_set, unsigned timeout_ms)
 {
 	uint8_t status;
@@ -313,11 +368,36 @@ static int v2_fpga_firmware_upload(const struct sr_dev_inst *sdi)
 	rd.header.size   = 1;
 	rd.data          = &hw_status;
 	if (command_ctl_rd_v2(hdl, rd) == SR_OK && (hw_status & bmFPGA_DONE)) {
-		sr_info("FPGA already configured (HW_STATUS=0x%02x); skipping bitstream upload.",
-			hw_status);
+		uint8_t hdl_ver = 0;
+
 		if (dsl_wr_reg_v2(sdi, CTR0_ADDR, 0) != SR_OK)
 			sr_warn("CTR0_ADDR dessert-clear failed on warm path.");
-		return SR_OK;
+
+		/*
+		 * The FPGA reports itself configured, but that bitstream may
+		 * be stale - left over from a different DSView/driver release
+		 * than this one (bmFPGA_DONE only reflects "something valid
+		 * is loaded", not "the right version is loaded"). DSView
+		 * detects exactly this with the same read and refuses to
+		 * proceed ("incorrect firmware, please replug" - confirmed a
+		 * version mismatch, not a timeout: the read succeeds and
+		 * returns promptly). We can do better: PROG_B is something we
+		 * already drive ourselves below, so on a mismatch we just
+		 * fall through to a real re-flash instead of trusting the
+		 * stale bitstream or requiring the user to physically
+		 * power-cycle the device.
+		 */
+		if (dslogic_hdl_version_v2(sdi, &hdl_ver) == SR_OK
+				&& hdl_ver == DSL_HDL_VERSION) {
+			sr_info("FPGA already configured (HW_STATUS=0x%02x, "
+				"HDL version 0x%02x matches); skipping "
+				"bitstream upload.", hw_status, hdl_ver);
+			return SR_OK;
+		}
+		sr_warn("FPGA reports configured but HDL version is 0x%02x "
+			"(expected 0x%02x) - stale bitstream from a "
+			"different release. Forcing a re-flash instead of "
+			"the usual warm-path skip.", hdl_ver, DSL_HDL_VERSION);
 	}
 
 	sr_dbg("Uploading FPGA bitstream '%s' via V2 envelope protocol.", name);

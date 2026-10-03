@@ -66,6 +66,9 @@
 #define SEC_DATA_ADDR   0x75
 #define SEC_CTRL_ADDR   0x73
 #define CTR0_ADDR       0x70
+#define ADCC_ADDR       0x48
+#define HDL_VERSION_ADDR 0x04
+#define DSL_HDL_VERSION  0x0e
 
 /* CTR0_ADDR bits (mirrors DSView command.h). */
 #define bmFORCE_RDY     (1 << 1)
@@ -87,6 +90,7 @@
 #define DSLOGIC_CAPS_CH32     (1 << 0)  /* 32 logic channels (needs DSL_setting_ext32). */
 #define DSLOGIC_CAPS_USB30    (1 << 1)  /* USB3 SuperSpeed: skip GPIF WORDWIDE, wider transfers. */
 #define DSLOGIC_CAPS_SECURITY (1 << 2)  /* Anti-clone EEPROM challenge-response at dev_open. */
+#define DSLOGIC_CAPS_ADF4360  (1 << 3)  /* ADF4360-based clock synth: needs ADC clock-config table at dev_open. */
 
 /* Trigger / setting blob (mirrors DSView dsl.h). */
 #ifndef NUM_TRIGGER_STAGES
@@ -231,5 +235,26 @@ SR_PRIV int dsl_rd_nvm_v2(const struct sr_dev_inst *sdi, uint8_t *buf, uint16_t 
 
 /* HW status polling helper. */
 SR_PRIV int dsl_wait_hw_status_bit_v2(libusb_device_handle *hdl, uint8_t bit_mask, gboolean want_set, unsigned timeout_ms);
+
+/*
+ * ADC clock-config step. DSView's dev_open() calls this unconditionally
+ * right after the VTH write, for every profile with CAPS_FEATURE_ADF4360
+ * (dslogic.c:1288-1290) - not just after a fresh FPGA bitstream upload.
+ * Without it the analog front-end's ADC never gets its clock divider
+ * programmed; this was missing from this driver entirely until now.
+ */
+SR_PRIV int dslogic_config_adc_v2(const struct sr_dev_inst *sdi);
+
+/*
+ * HDL (FPGA bitstream) version readback, mirrors DSView's
+ * dsl_hdl_version() (dsl.c). Only meaningful once the FPGA reports
+ * itself already configured (bmFPGA_DONE set): lets the caller detect
+ * a stale bitstream left over from a different DSView/driver release
+ * sitting on an FPGA this driver would otherwise trust and skip
+ * re-flashing - the exact condition behind DSView's own "incorrect
+ * firmware, please replug" dialog (confirmed: a value mismatch, not a
+ * timeout - the read itself succeeds and returns promptly).
+ */
+SR_PRIV int dslogic_hdl_version_v2(const struct sr_dev_inst *sdi, uint8_t *value);
 
 #endif

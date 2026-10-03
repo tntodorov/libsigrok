@@ -57,7 +57,7 @@ static const struct dslogic_profile supported_device[] = {
 	/* DreamSourceLab DSLogic U3Pro32 */
 	{ 0x2a0e, 0x002c, "DreamSourceLab", "DSLogic U3Pro32", NULL,
 		"dreamsourcelab-dslogic-u3pro32-fx3.fw",
-		DSLOGIC_CAPS_CH32 | DSLOGIC_CAPS_USB30,
+		DSLOGIC_CAPS_CH32 | DSLOGIC_CAPS_USB30 | DSLOGIC_CAPS_ADF4360,
 		"DreamSourceLab", "DSLogic", 2U * 1024 * 1024 * 1024,
 		DSL_PROTO_V2, &dslogic_v2_ops, 32},
 
@@ -399,6 +399,18 @@ static int dev_open(struct sr_dev_inst *sdi)
 	 * is uninitialised and subsequent arm-sequence status polls may
 	 * stall. Use a sensible default (1.0V on 3.3V logic). */
 	(void)devc->ops->set_voltage_threshold(sdi, 1.0, 1.0);
+
+	/*
+	 * DSView's dev_open() (dslogic.c) calls dsl_config_adc() right after
+	 * the VTH write, unconditionally, for every CAPS_FEATURE_ADF4360
+	 * profile - not just after a fresh FPGA bitstream upload. This
+	 * programs the analog front-end ADC's clock divider; without it the
+	 * ADC's sampling clock is left at its power-on default, which this
+	 * driver never set at all until now. Best-effort like DSView's own
+	 * loop (doesn't check individual register-write results either).
+	 */
+	if (devc->profile->dev_caps & DSLOGIC_CAPS_ADF4360)
+		(void)dslogic_config_adc_v2(sdi);
 
 	if (devc->cur_samplerate == 0) {
 		/* Samplerate hasn't been set; default to the slowest one. */
