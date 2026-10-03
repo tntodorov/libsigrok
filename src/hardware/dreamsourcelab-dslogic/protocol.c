@@ -934,9 +934,22 @@ static void deinterleave_buffer(const uint8_t *src, size_t length,
 	unsigned int unitsize)
 {
 	uint32_t sample;
+	const uint64_t *const src_end = (const uint64_t *)(src + length);
 
+	/*
+	 * Bound on "a full channel_count-word block remains", not just
+	 * "any bytes remain": if actual_length isn't an exact multiple of
+	 * channel_count * 8, the naive src_ptr < src_end check lets the
+	 * loop start one block too many, reading past the transfer buffer
+	 * and writing 64 more samples than devc->deinterleave_buffer was
+	 * sized for - a real heap overflow (confirmed via a double-free
+	 * crash on real hardware with a 1MB buffer and 3 enabled channels,
+	 * where 1048576 isn't a multiple of 3*8=24). Any trailing partial
+	 * block is simply dropped, matching the "Invalid transfer length!"
+	 * warning already logged by the caller for this case.
+	 */
 	for (const uint64_t *src_ptr = (uint64_t*)src;
-		src_ptr < (uint64_t*)(src + length);
+		src_ptr + channel_count <= src_end;
 		src_ptr += channel_count) {
 		for (int bit = 0; bit != 64; bit++) {
 			const uint64_t *word_ptr = src_ptr;
@@ -979,9 +992,18 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 	const size_t channel_count = enabled_channel_count(sdi);
 	const uint32_t channel_mask = enabled_channel_mask32(sdi);
 	const unsigned int unitsize = devc->sample_unitsize;
+	/*
+	 * Must match deinterleave_buffer()'s "complete blocks only" count
+	 * exactly: (ATOMIC_SAMPLES * actual_length) / (ATOMIC_BYTES *
+	 * channel_count), evaluated as a single division, can round UP
+	 * relative to floor(actual_length / (ATOMIC_BYTES * channel_count))
+	 * * ATOMIC_SAMPLES when actual_length isn't an exact multiple of
+	 * ATOMIC_BYTES * channel_count - over-reporting how many samples
+	 * were actually written and reading past the end of
+	 * devc->deinterleave_buffer in send_data(). Divide first.
+	 */
 	const unsigned int cur_sample_count = DSLOGIC_ATOMIC_SAMPLES *
-		transfer->actual_length /
-		(DSLOGIC_ATOMIC_BYTES * channel_count);
+		(transfer->actual_length / (DSLOGIC_ATOMIC_BYTES * channel_count));
 
 	gboolean packet_has_error = FALSE;
 	unsigned int num_samples;
@@ -1112,7 +1134,14 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 		 * Hopefully in future it will be possible to pass the data on as-is.
 		 */
 		if (transfer->actual_length % (DSLOGIC_ATOMIC_BYTES * channel_count) != 0)
-			sr_err("Invalid transfer length!");
+			sr_dbg("Transfer length %d isn't a multiple of the "
+				"atomic block size (%zu bytes for %zu "
+				"channels); trailing partial block dropped. "
+				"Expected whenever the fixed buffered-mode "
+				"buffer size doesn't evenly divide by the "
+				"enabled channel count - not an error.",
+				transfer->actual_length,
+				DSLOGIC_ATOMIC_BYTES * channel_count, channel_count);
 		deinterleave_buffer(transfer->buffer, transfer->actual_length,
 			devc->deinterleave_buffer, channel_count, channel_mask,
 			unitsize);
@@ -1201,39 +1230,81 @@ static size_t to_bytes_per_ms(const struct sr_dev_inst *sdi)
 	if (devc->continuous_mode)
 		return (devc->cur_samplerate * ch_count) / (1000 * 8);
 
-
-	/* If we're in buffered mode, the transfer rate is not so important,
-	 * but we expect to get at least 10% of the high-speed USB bandwidth.
+	/*
+	 * Buffered mode doesn't use this - see get_buffer_size()'s comment.
+	 * Kept only so callers that still (wrongly) multiply by it in a
+	 * continuous_mode-agnostic way don't divide by zero; actual
+	 * buffered-mode sizing never reaches here.
 	 */
 	return 35000000 / (1000 * 10);
 }
 
 static size_t get_buffer_size(const struct sr_dev_inst *sdi)
 {
+	const struct dev_context *const devc = sdi->priv;
+
 	/*
-	 * The buffer should be large enough to hold 10ms of data and
-	 * a multiple of the size of a data atom.
+	 * Buffered (non-continuous) mode mirrors DSView's get_buffer_size()
+	 * exactly: a flat 1MB, independent of channel count or samplerate.
+	 * The previous channel-count-scaled heuristic here produced a
+	 * buffer far smaller than what the device actually emits per burst
+	 * for narrow channel counts (e.g. 3 of 32 enabled), causing a real
+	 * USB-level overflow (confirmed via USB capture against real
+	 * U3Pro32 hardware: one bulk completion landed with
+	 * LIBUSB_TRANSFER_ERROR / EOVERFLOW at the exact byte count where
+	 * the undersized buffer ran out), which then cascaded into
+	 * persistent EPROTO errors on every following transfer. Wide
+	 * channel counts (e.g. 32) happened to produce a large-enough
+	 * buffer by coincidence under the old formula, which is why this
+	 * only ever showed up for narrow channel selections.
 	 */
-	const size_t block_size = enabled_channel_count(sdi) * 512;
-	const size_t s = 10 * to_bytes_per_ms(sdi);
-	if (!block_size)
-		return s;
-	return ((s + block_size - 1) / block_size) * block_size;
+	if (!devc->continuous_mode) {
+		const size_t mb = 1024 * 1024;
+		return (devc->usb_speed == LIBUSB_SPEED_SUPER)
+			? (mb + 1023) & ~(size_t)1023
+			: (mb + 511) & ~(size_t)511;
+	}
+
+	/*
+	 * Streaming (continuous) mode: buffer should be large enough to
+	 * hold 10ms of data and a multiple of the size of a data atom.
+	 */
+	{
+		const size_t block_size = enabled_channel_count(sdi) * 512;
+		const size_t s = 10 * to_bytes_per_ms(sdi);
+		if (!block_size)
+			return s;
+		return ((s + block_size - 1) / block_size) * block_size;
+	}
 }
 
 static unsigned int get_number_of_transfers(const struct sr_dev_inst *sdi)
 {
-	/* Total buffer size should be able to hold about 100ms of data. */
-	const unsigned int s = get_buffer_size(sdi);
-	const unsigned int n = (100 * to_bytes_per_ms(sdi) + s - 1) / s;
+	const struct dev_context *const devc = sdi->priv;
+	unsigned int n;
+
+	/* Buffered mode: DSView submits exactly one transfer (dsl.c). */
+	if (!devc->continuous_mode)
+		return 1;
+
+	/* Streaming mode: total buffer size should hold about 100ms of data. */
+	n = (100 * to_bytes_per_ms(sdi) + get_buffer_size(sdi) - 1) / get_buffer_size(sdi);
 	return (n > NUM_SIMUL_TRANSFERS) ? NUM_SIMUL_TRANSFERS : n;
 }
 
 static unsigned int get_timeout(const struct sr_dev_inst *sdi)
 {
-	const size_t total_size = get_buffer_size(sdi) *
-		get_number_of_transfers(sdi);
-	const unsigned int timeout = total_size / to_bytes_per_ms(sdi);
+	const struct dev_context *const devc = sdi->priv;
+	size_t total_size;
+	unsigned int timeout;
+
+	/* Buffered mode: DSView uses a flat 20ms timeout (dsl.c), not a
+	 * bandwidth-derived one. */
+	if (!devc->continuous_mode)
+		return 20;
+
+	total_size = get_buffer_size(sdi) * get_number_of_transfers(sdi);
+	timeout = total_size / to_bytes_per_ms(sdi);
 	return timeout + timeout / 4; /* Leave a headroom of 25% percent. */
 }
 
