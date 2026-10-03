@@ -480,6 +480,22 @@ static int dev_open(struct sr_dev_inst *sdi)
 		return SR_ERR;
 	}
 
+	if (devc->profile->protocol_version == DSL_PROTO_V2) {
+		/*
+		 * DSView's own recovery-from-wedged-device path issues
+		 * CLEAR_FEATURE(ENDPOINT_HALT) on the bulk endpoints before
+		 * retrying (observed via a real usbmon capture of it
+		 * recovering a device this driver could no longer talk to
+		 * after a crash). A prior crash or abrupt cancellation can
+		 * leave the OUT (bitstream/arm) or IN (sample data) bulk
+		 * pipe halted; clearing it here is cheap and a no-op if the
+		 * endpoint wasn't actually halted, so it's done
+		 * unconditionally on every open rather than only when a
+		 * problem is detected.
+		 */
+		(void)libusb_clear_halt(usb->devhdl, 2 | LIBUSB_ENDPOINT_OUT);
+		(void)libusb_clear_halt(usb->devhdl, 6 | LIBUSB_ENDPOINT_IN);
+	}
 
 	if ((ret = devc->ops->fpga_firmware_upload(sdi)) != SR_OK)
 		goto fail_release;
