@@ -124,6 +124,97 @@ static const uint64_t samplerates[] = {
 	SR_MHZ(400),
 };
 
+/*
+ * Full samplerate list for DSLOGIC_CAPS_CH32 profiles (U3Pro32), mirrors
+ * DSView's samplerates1000[] (dsl.h) exactly. Unlike the flat `samplerates`
+ * table above (shared by every other device, always exposed verbatim),
+ * this one gets dynamically capped at SR_CONF_SAMPLERATE query time to
+ * whatever the *currently selected* channel mode can actually achieve
+ * (250/500/1000 MHz for 32/16/8 channels respectively) - see
+ * samplerates1000_count_for_mode() in config_list().
+ */
+static const uint64_t samplerates1000[] = {
+	SR_HZ(10),
+	SR_HZ(20),
+	SR_HZ(50),
+	SR_HZ(100),
+	SR_HZ(200),
+	SR_HZ(500),
+	SR_KHZ(1),
+	SR_KHZ(2),
+	SR_KHZ(5),
+	SR_KHZ(10),
+	SR_KHZ(20),
+	SR_KHZ(40),
+	SR_KHZ(50),
+	SR_KHZ(100),
+	SR_KHZ(200),
+	SR_KHZ(400),
+	SR_KHZ(500),
+	SR_MHZ(1),
+	SR_MHZ(2),
+	SR_MHZ(4),
+	SR_MHZ(5),
+	SR_MHZ(10),
+	SR_MHZ(20),
+	SR_MHZ(25),
+	SR_MHZ(50),
+	SR_MHZ(100),
+	SR_MHZ(125),
+	SR_MHZ(250),
+	SR_MHZ(500),
+	SR_GHZ(1),
+};
+
+/*
+ * Highest enabled sr_channel index + 1, i.e. how many channels a mode
+ * needs to cover everything the frontend currently has checked. Shared
+ * by SR_CONF_CONTINUOUS's re-pick and the dynamic samplerate list below -
+ * both need this computed fresh from sdi->channels, not from a possibly
+ * stale devc->ch_mode_id (which only updates on an explicit samplerate/
+ * continuous config_set, not merely from a channel selection change).
+ */
+static unsigned int max_enabled_channel_plus_one(const struct sr_dev_inst *sdi)
+{
+	uint32_t m = enabled_channel_mask32(sdi);
+	unsigned int hi = 0, i;
+
+	for (i = 0; i < 32; i++)
+		if (m & (1U << i))
+			hi = i + 1;
+	return hi ? hi : 1;
+}
+
+/*
+ * How many leading entries of samplerates1000[] (ascending order) are
+ * achievable by whatever channel mode the currently-enabled channel set
+ * would auto-pick. Re-evaluated fresh on every call (not cached), so it
+ * reflects a -C/channel-popup change even before any samplerate/
+ * continuous config_set has run. Falls back to the full table if a mode
+ * can't be resolved at all.
+ */
+static size_t samplerates1000_count_for_mode(const struct sr_dev_inst *sdi)
+{
+	struct dev_context *devc = sdi->priv;
+	const struct dslogic_channel_mode *mode;
+	uint8_t mode_id;
+	size_t i;
+
+	mode_id = dslogic_auto_pick_mode_id(devc, devc->cur_samplerate,
+		devc->continuous_mode, devc->rle_mode,
+		max_enabled_channel_plus_one(sdi));
+	mode = dslogic_channel_mode_by_id(devc, mode_id);
+	if (!mode)
+		mode = dslogic_channel_mode_default(devc);
+	if (!mode)
+		return ARRAY_SIZE(samplerates1000);
+
+	for (i = 0; i < ARRAY_SIZE(samplerates1000); i++)
+		if (samplerates1000[i] > mode->max_samplerate)
+			return i;
+	return ARRAY_SIZE(samplerates1000);
+}
+
 static gboolean is_plausible(const struct libusb_device_descriptor *des)
 {
 	int i;
@@ -584,13 +675,9 @@ static int config_set(uint32_t key, GVariant *data,
 			/* Re-pick the channel mode for the new stream/buffer
 			 * choice; uses current samplerate + enabled-channel
 			 * count as hints. */
-			uint32_t m = enabled_channel_mask32(sdi);
-			unsigned int hi = 0, i;
-			for (i = 0; i < 32; i++)
-				if (m & (1U << i)) hi = i + 1;
 			devc->ch_mode_id = dslogic_auto_pick_mode_id(devc,
 				devc->cur_samplerate, devc->continuous_mode,
-				devc->rle_mode, hi ? hi : 1);
+				devc->rle_mode, max_enabled_channel_plus_one(sdi));
 		}
 		break;
 	case SR_CONF_CLOCK_EDGE:
@@ -627,7 +714,21 @@ static int config_list(uint32_t key, GVariant **data,
 	case SR_CONF_SAMPLERATE:
 		if (!devc)
 			return SR_ERR_ARG;
-		*data = std_gvar_samplerates(devc->samplerates, devc->num_samplerates);
+		if (devc->profile->dev_caps & DSLOGIC_CAPS_CH32) {
+			/*
+			 * Dynamic: capped to whatever the currently selected
+			 * channel mode can achieve, re-evaluated on every
+			 * query so a channel-count change picked up by the
+			 * frontend (e.g. PulseView re-querying after the
+			 * channels popup closes) sees the right ceiling -
+			 * DSView's own buffered-mode UI shows the same three
+			 * tiers (250/500/1000 MHz for 32/16/8 channels).
+			 */
+			*data = std_gvar_samplerates(samplerates1000,
+				samplerates1000_count_for_mode(sdi));
+		} else {
+			*data = std_gvar_samplerates(devc->samplerates, devc->num_samplerates);
+		}
 		break;
 	case SR_CONF_TRIGGER_MATCH:
 		*data = std_gvar_array_i32(ARRAY_AND_SIZE(trigger_matches));
