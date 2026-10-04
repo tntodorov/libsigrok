@@ -652,9 +652,30 @@ static int config_set(uint32_t key, GVariant *data,
 
 	switch (key) {
 	case SR_CONF_SAMPLERATE:
-		if ((idx = std_u64_idx(data, devc->samplerates, devc->num_samplerates)) < 0)
-			return SR_ERR_ARG;
-		devc->cur_samplerate = devc->samplerates[idx];
+		/*
+		 * For DSLOGIC_CAPS_CH32 profiles, validate against the full
+		 * samplerates1000[] table, NOT the channel-count-narrowed
+		 * view config_list() advertises: frontends don't guarantee
+		 * channels are already selected by the time samplerate gets
+		 * set (confirmed with sigrok-cli, which always applies
+		 * --config before -C regardless of argument order), so
+		 * narrowing here would reject a rate the user's about-to-be
+		 * -selected channels would actually support. The real
+		 * per-mode ceiling is still enforced at arm time
+		 * (v2_build_default_setting()'s existing cur_sr >
+		 * cm->max_samplerate clamp-and-warn), consistent with how
+		 * every other samplerate/channel-count mismatch is already
+		 * handled in this driver.
+		 */
+		if (devc->profile->dev_caps & DSLOGIC_CAPS_CH32) {
+			if ((idx = std_u64_idx(data, samplerates1000, ARRAY_SIZE(samplerates1000))) < 0)
+				return SR_ERR_ARG;
+			devc->cur_samplerate = samplerates1000[idx];
+		} else {
+			if ((idx = std_u64_idx(data, devc->samplerates, devc->num_samplerates)) < 0)
+				return SR_ERR_ARG;
+			devc->cur_samplerate = devc->samplerates[idx];
+		}
 		break;
 	case SR_CONF_LIMIT_SAMPLES:
 		devc->limit_samples = g_variant_get_uint64(data);
