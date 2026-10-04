@@ -201,7 +201,17 @@ struct dev_context {
 	gint64   total_deadline_us;
 	gboolean rearm_pending;
 
-	unsigned int sent_samples;
+	/*
+	 * Total sample count sent to the session bus so far, compared
+	 * against limit_samples/actual_samples (both uint64_t) to decide
+	 * when a capture is done. Must be 64-bit itself: a 32-bit counter
+	 * wraps at ~4.29 billion samples, which a long buffered RLE
+	 * capture at a realistic samplerate reaches in well under a
+	 * minute of wall-clock time - observed as the deinterleaved
+	 * output appearing to desync across channels once the wraparound
+	 * corrupts the budget/trigger-position bookkeeping.
+	 */
+	uint64_t sent_samples;
 	int submitted_transfers;
 	int empty_transfer_count;
 
@@ -218,6 +228,14 @@ struct dev_context {
 	 */
 	uint8_t leftover_buf[256];
 	unsigned int leftover_len;
+
+	/* TEMPORARY diagnostic (see receive_transfer()): catches
+	 * channel_count/channel_mask silently drifting mid-acquisition,
+	 * which would point at heap corruption rather than a logic bug. */
+	gboolean diag_armed;
+	unsigned int diag_channel_count;
+	uint32_t diag_channel_mask;
+	size_t diag_deinterleave_size;
 
 	unsigned int num_transfers;
 	struct libusb_transfer **transfers;

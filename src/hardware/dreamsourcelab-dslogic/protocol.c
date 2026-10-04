@@ -412,8 +412,16 @@ static bool set_trigger(const struct sr_dev_inst *sdi, struct fpga_config *cfg)
 	trigger_point = (devc->capture_ratio * devc->limit_samples) / 100;
 	if (trigger_point < DSLOGIC_ATOMIC_SAMPLES)
 		trigger_point = DSLOGIC_ATOMIC_SAMPLES;
-	const uint32_t mem_depth = devc->profile->mem_depth;
-	const uint32_t max_trigger_point = devc->continuous_mode ? ((mem_depth * 10) / 100) :
+	/*
+	 * Keep in 64 bits: mem_depth * 90 (or * DS_MAX_TRIG_PERCENT) can
+	 * overflow a 32-bit intermediate for large mem_depth values (e.g.
+	 * 256 MiB * 90 already exceeds UINT32_MAX), silently corrupting
+	 * the trigger-position cap. See the matching fix in
+	 * v2_build_default_setting() (protocol_v2.c) for the U3Pro32 case
+	 * that first exposed this (2 GiB * 90 wraps to exactly 0 there).
+	 */
+	const uint64_t mem_depth = devc->profile->mem_depth;
+	const uint64_t max_trigger_point = devc->continuous_mode ? ((mem_depth * 10) / 100) :
 		((mem_depth * DS_MAX_TRIG_PERCENT) / 100);
 	if (trigger_point > max_trigger_point)
 		trigger_point = max_trigger_point;
@@ -797,6 +805,7 @@ static void rearm_chunk_in_place(struct sr_dev_inst *sdi)
 	devc->actual_samples = 0;
 	devc->empty_transfer_count = 0;
 	devc->leftover_len = 0;
+	devc->diag_armed = FALSE;
 	devc->wallclock_deadline_us = 0;
 
 	g_free(devc->transfers);
@@ -994,6 +1003,25 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 	const uint32_t channel_mask = enabled_channel_mask32(sdi);
 	const unsigned int unitsize = devc->sample_unitsize;
 
+	/* TEMPORARY diagnostic: channel_count/channel_mask are recomputed
+	 * fresh from sdi->channels on every call rather than cached: if
+	 * either ever differs from what the FIRST call in this acquisition
+	 * saw, something mutated sdi->channels mid-capture (or memory
+	 * holding it got clobbered) - loudly flag it instead of silently
+	 * producing misaligned output. */
+	if (!devc->diag_armed) {
+		devc->diag_armed = TRUE;
+		devc->diag_channel_count = (unsigned int)channel_count;
+		devc->diag_channel_mask = channel_mask;
+	} else if (devc->diag_channel_count != (unsigned int)channel_count
+			|| devc->diag_channel_mask != channel_mask) {
+		sr_err("DIAG: channel_count/mask drifted mid-acquisition! "
+			"armed count=%u mask=0x%08x, now count=%zu mask=0x%08x, "
+			"sent_samples=%" PRIu64 ".",
+			devc->diag_channel_count, devc->diag_channel_mask,
+			channel_count, channel_mask, devc->sent_samples);
+	}
+
 	gboolean packet_has_error = FALSE;
 	unsigned int num_samples;
 	unsigned int cur_sample_count;
@@ -1055,7 +1083,7 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 	if (devc->wallclock_deadline_us
 			&& g_get_monotonic_time() >= devc->wallclock_deadline_us) {
 		sr_dbg("Stream+RLE: wall-clock deadline reached "
-		       "(sent_samples=%u of budget=%" PRIu64 ").",
+		       "(sent_samples=%" PRIu64 " of budget=%" PRIu64 ").",
 		       devc->sent_samples,
 		       devc->actual_samples ? devc->actual_samples
 					    : devc->limit_samples);
@@ -1078,7 +1106,7 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 			 * will work out that the samplecount is short.
 			 */
 			sr_info("Aborting acquisition after %u empty transfers; "
-				"sent_samples=%u, budget=%" PRIu64 ", "
+				"sent_samples=%" PRIu64 ", budget=%" PRIu64 ", "
 				"continuous=%d, rle=%d. The FPGA stopped "
 				"emitting data before reaching the requested "
 				"sample budget (likely RLE/USB-bandwidth "
@@ -1176,6 +1204,26 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 		deinterleave_buffer(proc_buf, proc_len,
 			devc->deinterleave_buffer, channel_count, channel_mask,
 			unitsize);
+
+		/* TEMPORARY diagnostic: verify the canary past
+		 * devc->deinterleave_buffer's logical end is still intact. */
+		{
+			const uint8_t *canary = (const uint8_t *)
+				devc->deinterleave_buffer + devc->diag_deinterleave_size;
+			int k;
+			for (k = 0; k < 16; k++) {
+				if (canary[k] != 0xA5) {
+					sr_err("DIAG: deinterleave_buffer canary "
+						"clobbered at byte %d (0x%02x), "
+						"cur_sample_count=%u proc_len=%zu "
+						"channel_count=%zu sent_samples=%"
+						PRIu64 ".", k, canary[k],
+						cur_sample_count, proc_len,
+						channel_count, devc->sent_samples);
+					break;
+				}
+			}
+		}
 
 		/* Send the incoming transfer to the session bus. */
 		if (devc->trigger_pos > devc->sent_samples
@@ -1367,6 +1415,7 @@ static int start_transfers(const struct sr_dev_inst *sdi)
 	devc->acq_aborted = FALSE;
 	devc->empty_transfer_count = 0;
 	devc->leftover_len = 0;
+	devc->diag_armed = FALSE;
 	devc->submitted_transfers = 0;
 	devc->wallclock_deadline_us = 0;
 
@@ -1387,13 +1436,19 @@ static int start_transfers(const struct sr_dev_inst *sdi)
 	 * yield one more complete block than this transfer's own size
 	 * alone would account for.
 	 */
-	devc->deinterleave_buffer = g_try_malloc(DSLOGIC_ATOMIC_SAMPLES *
-		(size / (channel_count * DSLOGIC_ATOMIC_BYTES) + 1) * devc->sample_unitsize);
+	devc->diag_deinterleave_size = DSLOGIC_ATOMIC_SAMPLES *
+		(size / (channel_count * DSLOGIC_ATOMIC_BYTES) + 1) * devc->sample_unitsize;
+	/* TEMPORARY diagnostic: 16-byte canary past the logical end, to
+	 * directly catch a heap overflow into this buffer rather than
+	 * inferring one from its symptoms. */
+	devc->deinterleave_buffer = g_try_malloc(devc->diag_deinterleave_size + 16);
 	if (!devc->deinterleave_buffer) {
 		sr_err("Deinterleave buffer malloc failed.");
 		g_free(devc->deinterleave_buffer);
 		return SR_ERR_MALLOC;
 	}
+	memset((uint8_t *)devc->deinterleave_buffer + devc->diag_deinterleave_size,
+		0xA5, 16);
 
 	devc->num_transfers = num_transfers;
 	for (i = 0; i < num_transfers; i++) {
@@ -1515,6 +1570,7 @@ SR_PRIV int dslogic_acquisition_start(const struct sr_dev_inst *sdi)
 	devc->actual_samples = 0;
 	devc->empty_transfer_count = 0;
 	devc->leftover_len = 0;
+	devc->diag_armed = FALSE;
 	devc->acq_aborted = FALSE;
 	devc->rearm_pending = FALSE;
 	devc->wallclock_deadline_us = 0;

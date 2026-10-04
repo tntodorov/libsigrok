@@ -1018,18 +1018,27 @@ static void v2_build_default_setting(const struct sr_dev_inst *sdi,
 	 * and 90% in buffered mode (DSL_MAX_TRIG_PERCENT, dsl.c:1104).
 	 */
 	{
-		uint32_t mem_depth = (uint32_t)devc->profile->mem_depth;
-		uint32_t tpos = (uint32_t)((devc->capture_ratio *
-				devc->limit_samples) / 100U);
-		uint32_t cap = devc->continuous_mode ? (mem_depth * 10U / 100U)
+		/*
+		 * mem_depth is 2 GiB (2^31) for U3Pro32: mem_depth * 90
+		 * alone is ~193e9, which overflows a 32-bit intermediate
+		 * (wraps to exactly 0 for this specific mem_depth, silently
+		 * zeroing tpos_l/tpos_h for every buffered capture). Keep
+		 * the whole computation in 64 bits and only narrow to
+		 * uint32_t at the very end, where the value is already
+		 * known to fit (it's bounded by mem_depth, itself way under
+		 * UINT32_MAX in sample units).
+		 */
+		uint64_t mem_depth = devc->profile->mem_depth;
+		uint64_t tpos = (devc->capture_ratio * devc->limit_samples) / 100U;
+		uint64_t cap = devc->continuous_mode ? (mem_depth * 10U / 100U)
 						     : (mem_depth * 90U / 100U);
 		if (tpos < 64U)
 			tpos = 64U;
 		if (tpos > cap)
 			tpos = cap;
-		tpos &= ~63U;   /* align down to 64-sample boundary */
+		tpos &= ~(uint64_t)63U;   /* align down to 64-sample boundary */
 		s->tpos_l = (uint16_t)(tpos & 0xffff);
-		s->tpos_h = (uint16_t)(tpos >> 16);
+		s->tpos_h = (uint16_t)((tpos >> 16) & 0xffff);
 	}
 
 	/* dso_cnt = 0 (unused in logic mode). */
