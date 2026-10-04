@@ -791,16 +791,21 @@ static unsigned int v2_max_enabled_plus_one(const struct sr_dev_inst *sdi);
  * the same condition must hold for both halves of the FPGA's
  * comparator network; that's what DSView SIMPLE_TRIGGER does.
  *
- * KNOWN GAP: at exactly half_samplerate/quarter_samplerate on an
- * ADF4360 profile (DSLOGIC_CAPS_ADF4360, e.g. QUAR_MODE_BIT set for a
- * 1 GHz U3Pro32 capture - see v2_build_default_setting()), DSView's
- * ds_trigger_get_*() (trigger.c) additionally replicate the trigger
- * mask/value/edge pattern across the FPGA's interleaved comparator
- * lanes for a match to be detected correctly at those rates. This
- * function does not do that replication. Immediate/no-trigger
- * captures at these rates are unaffected and work correctly (verified
- * on real hardware); a configured pattern trigger at exactly 500 MHz
- * or 1 GHz on U3Pro32 may not fire as expected until this is added.
+ * At exactly quarter_samplerate on an ADF4360 profile
+ * (DSLOGIC_CAPS_ADF4360, e.g. QUAR_MODE_BIT set for a 1 GHz U3Pro32
+ * capture - see v2_build_default_setting()), the trigger mask/value/
+ * edge pattern built above is additionally byte-replicated further
+ * down in this function (low byte copied into the high byte of
+ * trig_mask0/value0/edge0 only - reverse-engineered from a real
+ * working DSView capture's actual arm blob, which does NOT match a
+ * literal reading of DSView's trigger.c source - see that code's doc
+ * comment for the full story). half_samplerate (HALF_MODE_BIT) needs
+ * no equivalent handling - confirmed from DSView's own source
+ * (dsl.c:1136-1138) that HALF_MODE_BIT is a no-op for ADF4360
+ * hardware's trigger logic specifically, only QUAR_MODE_BIT matters
+ * there - and confirmed on real hardware (100% reliable triggering at
+ * 500 MHz, 0% at 1 GHz before the
+ * replication below was added).
  */
 static int v2_encode_trigger(const struct sr_dev_inst *sdi,
 			     struct DSL_setting *s)
@@ -883,6 +888,69 @@ static int v2_encode_trigger(const struct sr_dev_inst *sdi,
 		 * on arm. (DSView dsl.c:1060 packs trigger_en into this bit.)
 		 */
 		s->mode |= (uint16_t)(1U << DS_MODE_TRIG_EN_BIT);
+	}
+
+	/*
+	 * ADF4360-specific quarter-rate byte replication, at exactly
+	 * quarter_samplerate (QUAR_MODE_BIT - e.g. 1 GHz on U3Pro32 - see
+	 * v2_build_default_setting()).
+	 *
+	 * Reverse-engineered from a real, working DSView 1 GHz triggered
+	 * capture (usbmon trace of its actual arm blob), because the
+	 * initial attempt here - a 4-way nibble replication mirroring a
+	 * literal reading of DSView's trigger.c source, applied to both
+	 * the _0 and _1 register pairs - matched that source's formula
+	 * exactly but made real hardware behavior *worse*: it went from
+	 * "fires immediately regardless of the signal" (wrong position,
+	 * but at least completed) to "never fires at all, even forcing a
+	 * real qualifying edge" (hangs indefinitely). Requiring 4
+	 * replicated bit positions to all match simultaneously is
+	 * presumably physically impossible to satisfy, since they
+	 * represent the same physical channel sampled at 4 different
+	 * interleaved time phases, which can't all show a transition at
+	 * once.
+	 *
+	 * The real DSView capture's arm blob instead shows: the pattern
+	 * built from real channel indices (low byte, bits 0-7) copied into
+	 * the high byte (bits 8-15) too - a 2-way *byte* replication, not
+	 * a 4-way nibble one - applied ONLY to trig_mask0/value0/edge0.
+	 * trig_mask1/value1/edge1 are left entirely at their untouched
+	 * default ("don't care" - 0xffff/0/0), NOT mirrored from the _0
+	 * registers the way the normal (non-quarter-rate) case above does.
+	 */
+	{
+		struct dev_context *devc = sdi->priv;
+		const struct dslogic_channel_mode *cm = v2_current_channel_mode(devc);
+
+		if ((devc->profile->dev_caps & DSLOGIC_CAPS_ADF4360) && cm
+				&& devc->cur_samplerate == cm->hw_max_samplerate * 2) {
+			for (i = 0; i < NUM_TRIGGER_STAGES; i++) {
+				uint16_t m0 = (uint16_t)(s->trig_mask0[i]  & 0x00ff);
+				uint16_t v0 = (uint16_t)(s->trig_value0[i] & 0x00ff);
+				uint16_t e0 = (uint16_t)(s->trig_edge0[i]  & 0x00ff);
+
+				s->trig_mask0[i]  = (uint16_t)(m0 | (m0 << 8));
+				s->trig_value0[i] = (uint16_t)(v0 | (v0 << 8));
+				s->trig_edge0[i]  = (uint16_t)(e0 | (e0 << 8));
+
+				s->trig_mask1[i]  = 0xffff;
+				s->trig_value1[i] = 0;
+				s->trig_edge1[i]  = 0;
+
+				/*
+				 * Also at default (2, "always true") for every
+				 * stage including the active one - not 0
+				 * ("AND, active") the way the num_stages>0 block
+				 * above sets trig_logic0[0]/trig_logic1[0]
+				 * unconditionally. DSView's real capture leaves
+				 * both at 2; the trigger's activeness is conveyed
+				 * entirely by DS_MODE_TRIG_EN_BIT (already set
+				 * above) plus the mask/value/edge pattern itself.
+				 */
+				s->trig_logic0[i] = 2;
+				s->trig_logic1[i] = 2;
+			}
+		}
 	}
 
 	return num_stages;
