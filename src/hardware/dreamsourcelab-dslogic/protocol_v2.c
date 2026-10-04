@@ -790,6 +790,17 @@ static unsigned int v2_max_enabled_plus_one(const struct sr_dev_inst *sdi);
  * Mirroring trig_mask0/value0/edge0 to trig_mask1/value1/edge1 means
  * the same condition must hold for both halves of the FPGA's
  * comparator network; that's what DSView SIMPLE_TRIGGER does.
+ *
+ * KNOWN GAP: at exactly half_samplerate/quarter_samplerate on an
+ * ADF4360 profile (DSLOGIC_CAPS_ADF4360, e.g. QUAR_MODE_BIT set for a
+ * 1 GHz U3Pro32 capture - see v2_build_default_setting()), DSView's
+ * ds_trigger_get_*() (trigger.c) additionally replicate the trigger
+ * mask/value/edge pattern across the FPGA's interleaved comparator
+ * lanes for a match to be detected correctly at those rates. This
+ * function does not do that replication. Immediate/no-trigger
+ * captures at these rates are unaffected and work correctly (verified
+ * on real hardware); a configured pattern trigger at exactly 500 MHz
+ * or 1 GHz on U3Pro32 may not fire as expected until this is added.
  */
 static int v2_encode_trigger(const struct sr_dev_inst *sdi,
 			     struct DSL_setting *s)
@@ -928,10 +939,27 @@ static void v2_build_default_setting(const struct sr_dev_inst *sdi,
 	 *   bit 1  CLK_TYPE   - external clock if set
 	 *   bit 2  CLK_EDGE   - falling edge if set
 	 *   bit 3  RLE_MODE   - run-length encoding
+	 *   bit 5  HALF_MODE  - cur_samplerate == this mode's hw_max_samplerate
+	 *   bit 6  QUAR_MODE  - cur_samplerate == 2x hw_max_samplerate
 	 *   bit 8  FILTER     - 1T glitch filter
 	 *   bit 12 STREAM_MODE - streaming vs buffered
-	 * The DSLogic Plus has no DSO/ANALOG/HALF/QUAR modes so those bits
-	 * stay zero. Trigger bits stay zero until trigger support lands.
+	 * The DSLogic Plus has no DSO/ANALOG modes so those bits stay zero.
+	 * HALF_MODE/QUAR_MODE apply to ADF4360-based profiles (U3Pro32):
+	 * the chip's real comparator max is hw_max_samplerate (500 MHz for
+	 * U3Pro32); requesting exactly that or double that on a narrow
+	 * enough channel mode engages the FPGA's lane-interleaving trick.
+	 * Verified on real hardware: the wire/output format is NOT affected
+	 * (confirmed via sigrok-cli successfully capturing a full-depth,
+	 * correctly-timed normal-rate reference capture with the same
+	 * plain deinterleave logic used here), only this mode bit and -
+	 * for actual pattern triggers - the trigger mask/value/edge
+	 * replication DSView's ds_trigger_get_*() do for ADF4360 profiles
+	 * (dsl.c:1136-1138: only QUAR_MODE_BIT feeds replication on
+	 * ADF4360 hardware, HALF_MODE_BIT is a no-op there). That
+	 * replication isn't implemented yet (see v2_encode_trigger()) -
+	 * immediate/no-trigger captures at these rates work correctly,
+	 * pattern triggers at exactly 500 MHz/1 GHz are a known gap.
+	 * Trigger bits otherwise stay zero until trigger support lands.
 	 */
 	s->mode = 0;
 	if (cm->stream)
@@ -944,6 +972,12 @@ static void v2_build_default_setting(const struct sr_dev_inst *sdi,
 		s->mode |= (1 << DS_MODE_RLE_MODE_BIT);
 	if (devc->filter)
 		s->mode |= (1 << DS_MODE_FILTER_BIT);
+	if (devc->profile->dev_caps & DSLOGIC_CAPS_ADF4360) {
+		if (devc->cur_samplerate == cm->hw_max_samplerate)
+			s->mode |= (1 << DS_MODE_HALF_MODE_BIT);
+		else if (devc->cur_samplerate == cm->hw_max_samplerate * 2)
+			s->mode |= (1 << DS_MODE_QUAR_MODE_BIT);
+	}
 
 	/*
 	 * Samplerate divider (dsl.c, LOGIC mode branch).
