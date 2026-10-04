@@ -92,6 +92,16 @@
 #define DSLOGIC_CAPS_SECURITY (1 << 2)  /* Anti-clone EEPROM challenge-response at dev_open. */
 #define DSLOGIC_CAPS_ADF4360  (1 << 3)  /* ADF4360-based clock synth: needs ADC clock-config table at dev_open. */
 
+/*
+ * Safety ceiling for non-RLE buffered captures on DSLOGIC_CAPS_CH32
+ * profiles: real hardware desyncs (sample data rotates onto the wrong
+ * channel partway through) once required DDR3 bytes get large enough,
+ * empirically bisected on U3Pro32 between 700M samples (clean, 262.5 MB)
+ * and 725M samples (corrupted, 271.9 MB) at 3 channels/25 MHz. See the
+ * check in dslogic_acquisition_start() (protocol.c).
+ */
+#define DSLOGIC_SAFE_NONRLE_BYTES (265ULL * 1000 * 1000)
+
 /* Trigger / setting blob (mirrors DSView dsl.h). */
 #ifndef NUM_TRIGGER_STAGES
 #define NUM_TRIGGER_STAGES   16

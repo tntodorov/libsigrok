@@ -1565,6 +1565,46 @@ SR_PRIV int dslogic_acquisition_start(const struct sr_dev_inst *sdi)
 	devc = sdi->priv;
 	usb = sdi->conn;
 
+	/*
+	 * Non-RLE buffered captures: DDR3 bank-boundary safety guard.
+	 * DSView's own UI caps buffered (non-RLE) sample counts well under
+	 * this device's theoretical full-capacity depth (e.g. 20s @ 25 MHz,
+	 * ~500M samples, vs. a naive channel-count-based capacity of
+	 * billions). Empirically, real captures on real hardware desync -
+	 * sample data rotates onto the wrong channel partway through - once
+	 * the actual required DDR3 bytes cross somewhere around 256 MiB
+	 * (one eighth of this device's 2 GiB total): bisected on real
+	 * hardware between 700M samples (clean, 262.5 MB required) and
+	 * 725M samples (corrupted, 271.9 MB required) at 3 enabled
+	 * channels, 25 MHz. RLE sidesteps this entirely, since it writes
+	 * far fewer real DDR3 bytes for the same nominal sample count.
+	 * Reject rather than silently producing a corrupted capture.
+	 * DSLOGIC_SAFE_NONRLE_BYTES sits just below the confirmed-clean
+	 * 262.5 MB data point (not computed from the 256 MiB guess, which
+	 * would reject that known-good case) - revisit if a tighter real
+	 * boundary is ever pinned down.
+	 */
+	if ((devc->profile->dev_caps & DSLOGIC_CAPS_CH32) && !devc->continuous_mode
+			&& !devc->rle_mode) {
+		const uint64_t safe_bytes = DSLOGIC_SAFE_NONRLE_BYTES;
+		const unsigned int ch_count = enabled_channel_count(sdi);
+		const uint64_t required_bytes =
+			(uint64_t)ch_count * devc->limit_samples / 8U;
+		if (required_bytes > safe_bytes) {
+			sr_err("Buffered (non-RLE) capture of %" PRIu64 " samples "
+				"on %u channels needs ~%" PRIu64 " MiB of onboard "
+				"DDR3, over the ~%" PRIu64 " MiB safe limit for "
+				"this device without RLE (real captures beyond "
+				"this corrupt - sample data rotates onto the "
+				"wrong channel partway through). Enable RLE for "
+				"captures this large, or reduce the sample count.",
+				devc->limit_samples, ch_count,
+				required_bytes / (1024 * 1024),
+				safe_bytes / (1024 * 1024));
+			return SR_ERR_ARG;
+		}
+	}
+
 	devc->ctx = drvc->sr_ctx;
 	devc->sent_samples = 0;
 	devc->actual_samples = 0;
