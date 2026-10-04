@@ -1331,6 +1331,29 @@ static int v2_acquisition_stop(const struct sr_dev_inst *sdi)
 	return command_ctl_wr_v2(usb->devhdl, wr);
 }
 
+/*
+ * The FORCE_RDY-only half of v2_acquisition_stop(), without the
+ * immediately-following hard STOP. See the doc comment on
+ * struct dslogic_protocol_ops.soft_stop (protocol.h).
+ */
+static int v2_soft_stop(const struct sr_dev_inst *sdi)
+{
+	/*
+	 * bmSYS_EN, NOT bmFORCE_RDY. Confirmed against a real DSView
+	 * capture (usbmon trace + application log): DSView's "Stop"
+	 * button writes CTR0_ADDR := bmSYS_EN, and the already-pending
+	 * trigger-position header completes immediately afterward with a
+	 * genuinely valid check_id and a remain_cnt matching the real
+	 * elapsed capture time. bmFORCE_RDY only appears much later in
+	 * that trace - after finish_acquisition()/SR_DF_END have already
+	 * run - as a final cleanup step, not as what triggers the header.
+	 * An earlier version of this function wrote bmFORCE_RDY here,
+	 * which produced an immediately-completing but entirely zeroed
+	 * (invalid check_id) header on real hardware instead.
+	 */
+	return dsl_wr_reg_v2(sdi, CTR0_ADDR, bmSYS_EN);
+}
+
 /* Compute "need_channels" as max_enabled_index + 1, so contiguous-low
  * channels (0..N-1) trigger a small mode while sparse selections fall
  * back to a wider mode that covers the highest index in use. */
@@ -1404,6 +1427,7 @@ SR_PRIV const struct dslogic_protocol_ops dslogic_v2_ops = {
 	.fpga_config           = v2_fpga_config,
 	.acquisition_start     = v2_acquisition_start,
 	.acquisition_stop      = v2_acquisition_stop,
+	.soft_stop             = v2_soft_stop,
 	.set_samplerate        = v2_set_samplerate,
 	.set_voltage_threshold = v2_set_voltage_threshold,
 	.set_trigger           = v2_set_trigger,

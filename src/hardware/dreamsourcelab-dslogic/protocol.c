@@ -1534,17 +1534,40 @@ static void LIBUSB_CALL trigger_receive(struct libusb_transfer *transfer)
 	} else if (transfer->status == LIBUSB_TRANSFER_COMPLETED
 			&& transfer->actual_length == dslogic_header_size(devc)) {
 		tpos = (struct dslogic_trigger_pos *)transfer->buffer;
-		sr_info("tpos real_pos %d ram_saddr %d cnt_h %d cnt_l %d", tpos->real_pos,
+		sr_info("tpos check_id 0x%08x real_pos %d ram_saddr %d cnt_h %d cnt_l %d",
+			tpos->check_id, tpos->real_pos,
 			tpos->ram_saddr, tpos->remain_cnt_h, tpos->remain_cnt_l);
-		devc->trigger_pos = tpos->real_pos;
-		{
+
+		if (tpos->check_id != DSLOGIC_TRIG_CHECKID) {
+			/*
+			 * Invalid/garbage header - every field including
+			 * check_id reads back as zero. Confirmed harmless/
+			 * expected in one specific case on real hardware: a
+			 * pre-arm safety stop (or any other CTR0_ADDR write
+			 * made for a reason other than soft_stop()'s bmSYS_EN)
+			 * racing an already-pending header read completes it
+			 * with zeroed contents rather than a real reading.
+			 * remain_cnt can't be trusted here, so don't use it;
+			 * fall back to the un-shortened budget (the pre
+			 * -existing default behavior) instead of silently
+			 * acting on garbage.
+			 */
+			sr_warn("Trigger-position header has an invalid "
+				"check_id (0x%08x, expected 0x%08x) - "
+				"ignoring its contents.",
+				tpos->check_id, DSLOGIC_TRIG_CHECKID);
+			devc->actual_samples = (devc->chunk_loop && devc->chunk_samples)
+				? devc->chunk_samples : devc->limit_samples;
+		} else {
+			devc->trigger_pos = tpos->real_pos;
 			/*
 			 * In buffered (one-shot) mode with RLE the FPGA may have
 			 * captured fewer samples than requested (compressed buffer
-			 * exhausted). remain_cnt tells us by how much. Without this
-			 * adjustment the acquisition never reaches sent_samples >=
-			 * limit_samples and hangs. Matches DSView dsl.c
-			 * receive_header.
+			 * exhausted, or a user-initiated stop via soft_stop() -
+			 * see dslogic_acquisition_stop()). remain_cnt tells us by
+			 * how much. Without this adjustment the acquisition never
+			 * reaches sent_samples >= limit_samples and hangs. Matches
+			 * DSView dsl.c receive_header.
 			 *
 			 * In streaming (continuous) mode remain_cnt is an in-flight
 			 * "samples-remaining-to-send" counter that updates as the
@@ -1565,12 +1588,14 @@ static void LIBUSB_CALL trigger_receive(struct libusb_transfer *transfer)
 				else
 					devc->actual_samples = per_chunk;
 				if (devc->actual_samples != per_chunk)
-					sr_info("RLE shortened capture: %" PRIu64 " of %" PRIu64 " samples",
+					sr_info("RLE/stop-shortened capture: %" PRIu64 " of %" PRIu64 " samples",
 						devc->actual_samples, per_chunk);
 			} else {
 				devc->actual_samples = per_chunk;
 			}
 		}
+
+
 		g_free(tpos);
 		start_transfers(sdi);
 	}
@@ -1738,7 +1763,62 @@ SR_PRIV int dslogic_acquisition_stop(struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc = sdi->priv;
 
-	devc->ops->acquisition_stop(sdi);
-	abort_acquisition(sdi->priv);
+	if (devc->continuous_mode || devc->profile->protocol_version != DSL_PROTO_V2
+			|| !devc->ops->soft_stop) {
+		/*
+		 * Streaming: there's no onboard buffer of not-yet-
+		 * transferred data to drain - samples are already flowing
+		 * continuously as the FPGA produces them. End the session
+		 * immediately, as before.
+		 *
+		 * V1 devices (soft_stop is NULL there): command_stop_acquisition()
+		 * is a single hard stop with no graceful-wrap-up equivalent
+		 * to V2's soft_stop(), so there's no reason to expect the
+		 * pending header read would ever complete on its own after
+		 * it - letting the session hang waiting for it would be
+		 * worse than today's "shows nothing" behavior. Not verified
+		 * against real V1 hardware either way, so keep the known
+		 * -safe immediate-stop behavior unchanged here.
+		 */
+		devc->ops->acquisition_stop(sdi);
+		abort_acquisition(devc);
+		return SR_OK;
+	}
+
+	/*
+	 * Buffered, V2: send ONLY the soft-stop (CTR0_ADDR := bmSYS_EN),
+	 * not the hard STOP devc->ops->acquisition_stop() would also send.
+	 *
+	 * Confirmed on real hardware (usbmon trace + DSView's own
+	 * application log, which prints every acquisition-lifecycle step):
+	 * DSView's "Stop" button for a buffered capture writes bmSYS_EN to
+	 * CTR0_ADDR, and the already-pending trigger-position header read
+	 * (posted at arm time, before DSL_CTL_START - see
+	 * dslogic_acquisition_start()) completes immediately afterward
+	 * with a genuinely valid header: real check_id, and a remain_cnt
+	 * matching the actual elapsed capture time. DSView's hard STOP
+	 * (bmFORCE_RDY + DSL_CTL_STOP) only appears much later in that
+	 * trace/log - after finish_acquisition()/SR_DF_END have already
+	 * run - as a final housekeeping step for the FPGA's LED/state
+	 * ahead of the *next* capture, not as what makes this one stop.
+	 * (bmFORCE_RDY alone, tried first here, produced a header that
+	 * completed just as promptly but was entirely zeroed instead of a
+	 * real reading - it answers a different purpose than bmSYS_EN.)
+	 *
+	 * So: just send bmSYS_EN and return. The ordinary receive loop
+	 * naturally drains however much real data the header's remain_cnt
+	 * indicates was actually captured (the same "RLE shortened
+	 * capture" handling an early-exhausted RLE buffer already uses -
+	 * see trigger_receive()) and ends the session on its own once that
+	 * (possibly reduced) budget is reached, instead of discarding
+	 * whatever was already captured. No explicit hard STOP is sent by
+	 * this driver afterward (DSView's own is non-critical cleanup,
+	 * sent well after its session already ended); not observed to
+	 * cause any problem across repeated stop/re-arm testing on real
+	 * hardware, but flagging the asymmetry with DSView's full sequence
+	 * honestly in case a LED/stuck-state issue surfaces on some future
+	 * capture after a stop.
+	 */
+	devc->ops->soft_stop(sdi);
 	return SR_OK;
 }

@@ -41,6 +41,18 @@ struct dslogic_protocol_ops {
 	int (*fpga_config)(const struct sr_dev_inst *sdi);
 	int (*acquisition_start)(const struct sr_dev_inst *sdi);
 	int (*acquisition_stop)(const struct sr_dev_inst *sdi);
+	/*
+	 * Optional (NULL for V1, which has no graceful-wrap-up equivalent):
+	 * the FORCE_RDY-only half of acquisition_stop(), without the
+	 * immediately-following hard STOP. Used for a user-initiated stop
+	 * of a buffered capture, so the already-pending trigger-position
+	 * header read can complete naturally (with a real remain_cnt
+	 * reflecting whatever was actually captured) before the hard STOP
+	 * is sent - sending STOP immediately interrupts that, and the
+	 * header comes back zeroed/invalid instead. See
+	 * dslogic_acquisition_stop() and trigger_receive() (protocol.c).
+	 */
+	int (*soft_stop)(const struct sr_dev_inst *sdi);
 	int (*set_samplerate)(const struct sr_dev_inst *sdi, uint64_t rate);
 	int (*set_voltage_threshold)(const struct sr_dev_inst *sdi, double low, double high);
 	int (*set_trigger)(const struct sr_dev_inst *sdi);
@@ -98,6 +110,12 @@ struct dslogic_mode {
 	uint8_t sample_delay_h;
 	uint8_t sample_delay_l;
 };
+
+/* Magic value a genuine trigger-position header's check_id carries
+ * (mirrors DSView's TRIG_CHECKID, dsl.h). A header that completes
+ * without this - e.g. a user-stop-triggered completion that raced the
+ * FPGA's own wrap-up - is garbage, not a real reading. */
+#define DSLOGIC_TRIG_CHECKID 0x55555555
 
 struct dslogic_trigger_pos {
 	uint32_t check_id;
