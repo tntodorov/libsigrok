@@ -1325,43 +1325,66 @@ static size_t to_bytes_per_ms(const struct sr_dev_inst *sdi)
 	return 35000000 / (1000 * 10);
 }
 
+/*
+ * DSView dsl.c's get_single_buffer_time()/get_total_buffer_time(): a
+ * single streaming transfer should hold this many ms of data; the full
+ * set of concurrently-submitted transfers should hold this many ms.
+ * SuperSpeed gets tighter numbers (10/40) than HighSpeed (20/100) -
+ * USB3's higher throughput means the same millisecond window is a
+ * bigger, over-generous buffer if left at the HighSpeed numbers.
+ */
+static unsigned int get_single_buffer_time(const struct dev_context *devc)
+{
+	return (devc->usb_speed == LIBUSB_SPEED_SUPER) ? 10 : 20;
+}
+
+static unsigned int get_total_buffer_time(const struct dev_context *devc)
+{
+	return (devc->usb_speed == LIBUSB_SPEED_SUPER) ? 40 : 100;
+}
+
 static size_t get_buffer_size(const struct sr_dev_inst *sdi)
 {
 	const struct dev_context *const devc = sdi->priv;
+	size_t s;
 
 	/*
 	 * Buffered (non-continuous) mode mirrors DSView's get_buffer_size()
 	 * exactly: a flat 1MB, independent of channel count or samplerate.
-	 * The previous channel-count-scaled heuristic here produced a
-	 * buffer far smaller than what the device actually emits per burst
-	 * for narrow channel counts (e.g. 3 of 32 enabled), causing a real
+	 * An earlier channel-count-scaled heuristic here produced a buffer
+	 * far smaller than what the device actually emits per burst for
+	 * narrow channel counts (e.g. 3 of 32 enabled), causing a real
 	 * USB-level overflow (confirmed via USB capture against real
 	 * U3Pro32 hardware: one bulk completion landed with
 	 * LIBUSB_TRANSFER_ERROR / EOVERFLOW at the exact byte count where
 	 * the undersized buffer ran out), which then cascaded into
 	 * persistent EPROTO errors on every following transfer. Wide
 	 * channel counts (e.g. 32) happened to produce a large-enough
-	 * buffer by coincidence under the old formula, which is why this
-	 * only ever showed up for narrow channel selections.
+	 * buffer by coincidence under that formula, which is why it only
+	 * ever showed up for narrow channel selections.
 	 */
 	if (!devc->continuous_mode) {
-		const size_t mb = 1024 * 1024;
-		return (devc->usb_speed == LIBUSB_SPEED_SUPER)
-			? (mb + 1023) & ~(size_t)1023
-			: (mb + 511) & ~(size_t)511;
+		s = 1024 * 1024;
+	} else {
+		/*
+		 * Streaming (continuous) mode. DSView rounds this to a FIXED
+		 * 1024/512-byte boundary (by USB speed), not a channel-count
+		 * -scaled one. A channel-count-scaled rounding here (an
+		 * earlier version of this function) produced a smaller,
+		 * insufficiently-margined buffer for some samplerate/channel
+		 * -count combinations than DSView's real formula does -
+		 * confirmed via real hardware: 50 MHz on 3 channels
+		 * overflowed the very first streaming transfer (EOVERFLOW,
+		 * cascading into EPROTO on every transfer after), even
+		 * though 25 MHz on the same 3 channels - same formula shape,
+		 * just a smaller buffer - was fine.
+		 */
+		s = get_single_buffer_time(devc) * to_bytes_per_ms(sdi);
 	}
 
-	/*
-	 * Streaming (continuous) mode: buffer should be large enough to
-	 * hold 10ms of data and a multiple of the size of a data atom.
-	 */
-	{
-		const size_t block_size = enabled_channel_count(sdi) * 512;
-		const size_t s = 10 * to_bytes_per_ms(sdi);
-		if (!block_size)
-			return s;
-		return ((s + block_size - 1) / block_size) * block_size;
-	}
+	return (devc->usb_speed == LIBUSB_SPEED_SUPER)
+		? (s + 1023) & ~(size_t)1023
+		: (s + 511) & ~(size_t)511;
 }
 
 static unsigned int get_number_of_transfers(const struct sr_dev_inst *sdi)
@@ -1373,8 +1396,14 @@ static unsigned int get_number_of_transfers(const struct sr_dev_inst *sdi)
 	if (!devc->continuous_mode)
 		return 1;
 
-	/* Streaming mode: total buffer size should hold about 100ms of data. */
-	n = (100 * to_bytes_per_ms(sdi) + get_buffer_size(sdi) - 1) / get_buffer_size(sdi);
+	/*
+	 * Streaming mode: the full set of concurrently-submitted transfers
+	 * should hold about get_total_buffer_time() ms of data (40 ms SS /
+	 * 100 ms HighSpeed - see that function), not a value hardcoded to
+	 * the HighSpeed number regardless of actual USB speed.
+	 */
+	n = (get_total_buffer_time(devc) * to_bytes_per_ms(sdi) + get_buffer_size(sdi) - 1)
+		/ get_buffer_size(sdi);
 	return (n > NUM_SIMUL_TRANSFERS) ? NUM_SIMUL_TRANSFERS : n;
 }
 
